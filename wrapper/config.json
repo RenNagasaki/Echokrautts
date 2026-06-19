@@ -1,0 +1,28 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "parent_pid": null,
+  "api_key": null,
+  "python_version": "3.11",
+  "torch_version": "2.7.0",
+  "torchaudio_version": "2.7.0",
+  "language": "de",
+  "languages": {
+    "en": { "arch": "F5TTS_v1_Base" },
+    "de": { "arch": "F5TTS_Base", "hf_repo": "hvoss-techfak/F5-TTS-German", "ckpt_file": "model_f5tts_german.safetensors", "vocab_file": "vocab.txt" },
+    "fr": { "arch": "F5TTS_Base", "hf_repo": "RASPIAUDIO/F5-French-MixedSpeakers-reduced", "ckpt_file": "model_last_reduced.pt", "vocab_file": "vocab.txt" },
+    "ja": { "arch": "F5TTS_Base", "hf_repo": "Jmica/F5TTS", "ckpt_file": "JA_21999120/model_21999120.pt", "vocab_file": "JA_21999120/vocab_japanese.txt" }
+  },
+  "samples_dir": "samples",
+  "models_dir": "models",
+  "max_workers": null,
+  "vram_reserve_gb": 1.5,
+  "per_job_gb": 3.0,
+  "max_queue": 64,
+  "max_chars_per_chunk": 250,
+  "asr_for_missing_ref_text": true,
+  "allowed_sample_ext": [".wav", ".flac", ".mp3"],
+  "hf_endpoint": null,
+  "torch_index_override": null,
+  "log_level": "info"
+}

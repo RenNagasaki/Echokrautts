@@ -1,0 +1,22 @@
+# Bootstrap-managed, machine-local artifacts — never committed.
+.uv/
+.venv/
+.venv-test/
+.state/
+models/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Scratch artifacts from manual testing
+out.pcm
+*.wav
+body.json
+headers.txt
+bootstrap.log
+orphan.log
+orphan.err
+
+# Voice samples are provided by the host at runtime; keep the dir, ignore contents.
+samples/*
+!samples/.gitkeep
