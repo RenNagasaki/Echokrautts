@@ -1,0 +1,38 @@
+[project]
+name = "f5-tts-wrapper"
+version = "0.1.0"
+description = "Lightweight REST wrapper around F5-TTS for streaming voice-cloning TTS, driven by a host process."
+requires-python = ">=3.10"
+# NOTE: torch / torchaudio / torch-directml are intentionally NOT listed here.
+# The bootstrap installs them from a backend-specific index (CUDA/ROCm/DirectML/CPU)
+# determined at runtime by gpu_detect.py (see SPEC §3 step 4 and §4).
+dependencies = [
+    "f5-tts",
+    "fastapi",
+    "uvicorn",
+    "soundfile",
+    "numpy",
+    "pydantic>=2",
+]
+
+[project.optional-dependencies]
+# Dev/test deps only. These deliberately do NOT pull torch or f5-tts so the unit
+# suite runs anywhere; f5-tts/torch are mocked in tests (see tests/conftest.py).
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+    "fastapi",
+    "numpy",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
