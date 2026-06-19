@@ -1,0 +1,48 @@
+# Echokrautts CI — Python F5-TTS wrapper.
+# NOTE: This is NOT a C# Dalamud plugin, so the parent Dalamud SonarQube/.NET
+# pipeline does not apply here (see wrapper-repo CLAUDE.md). Two jobs only:
+#   1. test   — run the unit suite (torch/f5-tts mocked) on every branch.
+#   2. mirror — additive push of all branches + tags to the GitHub mirror, main only.
+
+stages:
+  - test
+  - mirror
+
+# ---------------------------------------------------------------------------
+# Unit tests. The suite deliberately mocks torch/f5-tts (see wrapper/conftest.py),
+# so it needs only the lightweight dev deps and runs in a plain Python image.
+# ---------------------------------------------------------------------------
+test:
+  stage: test
+  image: python:3.12-slim
+  rules:
+    - if: $CI_COMMIT_BRANCH
+  before_script:
+    - python -m pip install --upgrade pip
+    # Install dev/test deps explicitly — do NOT `pip install .[dev]`, which would
+    # drag in the base deps (f5-tts → torch) that the tests mock and never need.
+    - pip install pytest pytest-asyncio httpx fastapi numpy
+  script:
+    - cd wrapper
+    - python -m pytest -q
+
+# ---------------------------------------------------------------------------
+# GitHub mirror. Additive (--all --force + --tags), main only.
+# Never `git push --mirror`: it deletes GitHub-only tags and breaks the
+# Releases attached to them. Additive push is purely safe for release assets.
+# ---------------------------------------------------------------------------
+mirror-to-github:
+  stage: mirror
+  image: alpine/git:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  script:
+    - git clone --mirror "$CI_REPOSITORY_URL" repo.git
+    - cd repo.git
+    # Hardcoded GitHub repo path. ${GITHUB_USER} is the CI auth identity (PAT
+    # owner) and is generally NOT the repo owner — using it on both sides routes
+    # the push to the wrong repo and 403s. GitLab project name is lowercase,
+    # GitHub repo name is "Echokrautts" — so hardcode the exact path.
+    - git remote add github "https://${GITHUB_USER}:${GITHUB_PAT}@github.com/RenNagasaki/Echokrautts.git"
+    - git push github --all --force
+    - git push github --tags
