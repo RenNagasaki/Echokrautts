@@ -1,93 +1,131 @@
 # Echokrautts
 
+A lightweight, plug-and-play Python wrapper around two **voice-cloning TTS** engines —
+[F5-TTS](https://github.com/SWivid/F5-TTS) and [XTTS-v2](https://huggingface.co/coqui/XTTS-v2) —
+that a host application (e.g. a C#/Dalamud plugin) starts as a **separate process** and drives
+over stdout (NDJSON events) and HTTP (streaming PCM). It provides zero-shot voice cloning with
+sentence-level streaming, a VRAM-aware worker pool, and self-contained installation via
+[`uv`](https://github.com/astral-sh/uv) — no system Python or git required.
 
+The wrapper lives in [`wrapper/`](wrapper/); the full specification is in
+[`F5-TTS-Wrapper-SPEC.md`](F5-TTS-Wrapper-SPEC.md), and the licenses of everything it installs are in
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
 
-## Getting started
+## Quick start
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+The simplest entry point is the one-click launcher in the repo root — it fetches `uv`, installs
+everything on first run, then serves:
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
+```bash
+start.bat            # Windows (visible window, pauses at the end)
+./start.sh           # Linux/macOS
 ```
-cd existing_repo
-git remote add origin https://gitlab.echotools.cloud/echotools/echokrautts.git
-git branch -M main
-git push -uf origin main
+
+Both forward extra arguments, e.g. `start.bat --tts-backend xtts --language en`.
+
+Under the hood these call `wrapper/bootstrap/install_win.ps1` / `install_linux.sh` (which fetch `uv`)
+with `--start`. A host process that already has a Python can run the bootstrap directly:
+
+```bash
+python wrapper/bootstrap/bootstrap.py --start --parent-pid <host_pid>
 ```
 
-## Integrate with your tools
+The bootstrap runs a fixed 6-step sequence (obtain `uv` → pin Python → detect GPU → install deps →
+preload models → serve) and reports each step as an NDJSON `progress` event on stdout. When the
+server is listening it emits a `ready` event with host/port/backend. **Both TTS engines and all of
+their model weights are installed once**, so switching engine or language is only a restart (see
+[TTS backends](#tts-backends)).
 
-* [Set up project integrations](https://gitlab.echotools.cloud/echotools/echokrautts/-/settings/integrations)
+### Why torch is pinned to 2.7.x
 
-## Collaborate with your team
+`torch`/`torchaudio` are pinned (configurable via `torch_version`/`torchaudio_version`). Newer
+torchaudio routes `torchaudio.load` through **torchcodec**, which requires system **FFmpeg** shared
+libraries — an external, non-self-contained dependency. On 2.7.x, `torchaudio.load` still uses the
+bundled-libsndfile **soundfile** backend, so the wrapper installs and runs with **no external
+binaries**. The TTS engines declare `torchcodec` as a dependency but never import it (they only call
+`torchaudio.load`), so the bootstrap re-pins torch after the deps install and drops the unused
+torchcodec. Bump the pins deliberately and re-verify the soundfile path if you change them.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+## HTTP API
 
-## Test and Deploy
+| Method & path        | Purpose                                                            |
+|----------------------|--------------------------------------------------------------------|
+| `POST /tts`          | Streaming synthesis. Body = raw PCM (`pcm_s16le`, mono). Metadata in `X-Job-Id` / `X-Sample-Rate` / `X-Channels` / `X-Sample-Format` headers. |
+| `GET /samples`       | Usable voice-sample names (`?details=true` adds `has_ref_text`/`bytes`). |
+| `POST /cancel/{id}`  | Cancel a running job.                                              |
+| `GET /jobs/{id}`     | Live progress (`sentences_done`/`sentences_total`/`percent`).      |
+| `GET /health`        | Backend/device/worker/queue status.                               |
+| `POST /shutdown`     | Graceful shutdown.                                                 |
 
-Use the built-in continuous integration in GitLab.
+Configuration lives in `wrapper/config.json` (overridable by `F5W_*` env vars and `--kebab-case` CLI
+flags; precedence JSON < ENV < CLI). For remote use set `host` to `0.0.0.0` and an `api_key` (then
+all requests need `Authorization: Bearer <key>`).
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+## Voice samples
 
-***
+Drop `*.wav`/`*.flac`/`*.mp3` files into `wrapper/samples/`. Requests reference a sample by
+**basename only** (path traversal is rejected). For the `f5` backend a reference transcript is taken
+from a sidecar `<name>.txt`, else the request's `ref_text`, else auto-transcribed via F5-TTS's
+built-in ASR and cached. The `xtts` backend needs no transcript (it clones from the audio alone).
 
-# Editing this README
+## TTS backends
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+The wrapper ships two interchangeable engines. A process loads **one** at startup, selected by
+`tts_backend` (config) or `--tts-backend <f5|xtts>` (default `f5`). `GET /health` reports the active
+backend. Both engines are installed by the bootstrap, so switching is only a restart.
 
-## Suggestions for a good README
+| Backend | Model | Reference transcript | Notes |
+|---------|-------|----------------------|-------|
+| `f5`   | F5-TTS finetunes (per language) | needed — from a sidecar `.txt`, the request's `ref_text`, or auto-transcribed via F5's built-in ASR | code MIT, weights CC-BY-NC |
+| `xtts` | Coqui XTTS-v2 (one multilingual model) | **not needed** — clones from the audio alone | code MPL-2.0, weights CPML (non-commercial) |
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+Both output mono `pcm_s16le` at 24000 Hz, so the HTTP contract is identical. XTTS is served via the
+maintained [`coqui-tts`](https://github.com/idiap/coqui-ai-TTS) fork (the original `TTS` package is
+unmaintained). See [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for the full license matrix.
 
-## Name
-Choose a self-explaining name for your project.
+## Languages
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+A wrapper process serves **one language**, chosen at startup via `language` (config) or
+`--language <code>`. For the `f5` backend each language maps to a distinct model in the `languages`
+config block; the `xtts` backend covers all of them with its single multilingual model.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+| Lang | F5 model | Source |
+|------|----------|--------|
+| `en` | `F5TTS_v1_Base` | official multilingual base (auto-downloaded) |
+| `de` | `F5TTS_Base` finetune | `hvoss-techfak/F5-TTS-German` (CC-BY-NC) |
+| `fr` | `F5TTS_Base` finetune | `RASPIAUDIO/F5-French-MixedSpeakers-reduced` (CC-BY-NC) |
+| `ja` | `F5TTS_Base` finetune | `Jmica/F5TTS` (CC-BY-NC) |
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+The bootstrap **downloads all four** F5 checkpoints (and the XTTS-v2 model) at install time, so
+switching language or backend is just a restart with a different `--language` / `--tts-backend` (no
+re-download). `GET /health` reports the active language. A `/tts` request whose `language` field
+doesn't match the loaded language is rejected with `400` (prevents synthesizing in the wrong
+accent). Provide a **reference sample in the target language** (and, for `f5`, ideally a matching
+`.txt` transcript) for best results. To add/replace an F5 language, edit the `languages` map in
+`wrapper/config.json` (verify repo + file names against F5-TTS `SHARED.md`).
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+## Development
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+```bash
+cd wrapper
+uv venv .venv-test --python 3.11
+uv pip install --python .venv-test pytest pytest-asyncio httpx fastapi numpy
+.venv-test/Scripts/python -m pytest -q   # 0 failures expected
+```
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+The unit suite mocks F5-TTS/torch, so it runs anywhere without GPU or multi-GB downloads.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+## Licensing
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- **Wrapper code: AGPL-3.0.**
+- **All speech-model weights are NON-COMMERCIAL** and are kept strictly separate from this AGPL
+  code: F5-TTS weights (base + finetunes) are **CC-BY-NC-4.0**, XTTS-v2 weights are under the
+  **Coqui Public Model License (CPML)**. They are *not* shipped in this repo — the bootstrap
+  downloads them at runtime into `wrapper/models/`. The synthesized audio (model *output*) inherits
+  these terms, so **you may not use it commercially** without a separate license from the rights
+  holder. Keep each model's license notice with any distribution and do not relicense the weights.
+- The installed Python packages carry their own (mostly permissive) licenses — f5-tts is **MIT**,
+  coqui-tts is **MPL-2.0**, the rest are BSD/MIT/Apache.
+- See [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for the complete manifest of installed
+  packages and models with their licenses, and [`licenses/`](licenses/) for vendored full-text
+  licenses (currently the CPML, whose original host `coqui.ai` is offline).
