@@ -24,5 +24,10 @@ if (-not (Test-Path $uv)) {
 }
 
 # Run the bootstrap with uv's managed Python, forwarding all args (e.g. --start).
-& $uv run --python 3.11 python (Join-Path $PSScriptRoot "bootstrap.py") @args
+# --no-project is REQUIRED: this script's cwd may be the wrapper dir (which has a
+# pyproject.toml). Without it, `uv run` treats that as a project and auto-creates
+# AND syncs `.venv` from pyproject (f5-tts → torch 2.12+cpu + torchcodec from
+# PyPI) *before* bootstrap.py runs — clobbering the carefully pinned torch
+# (2.7.0+cu128, no torchcodec) that step_deps installs. bootstrap.py owns .venv.
+& $uv run --no-project --python 3.11 python (Join-Path $PSScriptRoot "bootstrap.py") @args
 exit $LASTEXITCODE

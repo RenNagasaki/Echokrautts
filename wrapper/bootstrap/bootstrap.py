@@ -275,7 +275,10 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
         ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten vorhanden", skipped=True)
         return
     ndjson.progress(index, TOTAL_STEPS, step, "Erstelle venv …")
-    _run_uv(["venv", str(VENV_DIR), "--python", config.python_version], index, step)
+    # --clear: replace any pre-existing .venv (e.g. one an earlier `uv run`
+    # accidentally synced from pyproject) instead of failing "already exists".
+    # We own this venv and install the pinned torch into it below.
+    _run_uv(["venv", str(VENV_DIR), "--clear", "--python", config.python_version], index, step)
 
     py = str(_venv_python())
     torch_pin = f"torch=={config.torch_version}"
@@ -308,8 +311,40 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
         ndjson.progress(index, TOTAL_STEPS, step, f"Installiere {extra} …", percent=90)
         _run_uv(["pip", "install", "--python", py, extra], index, step)
 
+    # Verify BEFORE marking done: the project install (f5-tts) can win the torch
+    # resolution and leave behind a PyPI CPU build + torchcodec, which loads fine
+    # at startup but crashes on the first ``torchaudio.load`` (→ "Could not load
+    # libtorchcodec"). If that slipped past the re-pin/uninstall, fail loudly so
+    # ``deps.done`` is NOT written and the next run rebuilds — never freeze a
+    # broken venv behind the marker (SPEC §3 idempotency must not cache garbage).
+    _verify_torch(py, config)
+
     _mark_done(step)
     ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten installiert", done=True)
+
+
+def _verify_torch(py: str, config) -> None:
+    """Assert the venv ended up with the pinned, torchcodec-free torch."""
+    code = (
+        "import json, importlib.util as u, torch;"
+        "print(json.dumps({'v': torch.__version__,"
+        " 'codec': u.find_spec('torchcodec') is not None}))"
+    )
+    proc = procutil.run([py, "-c", code])
+    if proc.returncode != 0:
+        raise FatalError(f"torch verification failed to run: {proc.stderr.strip()}")
+    try:
+        info = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError) as exc:
+        raise FatalError(f"torch verification: unparseable output {proc.stdout!r}") from exc
+    base = str(info.get("v", "")).split("+")[0]
+    if base != config.torch_version or info.get("codec"):
+        raise FatalError(
+            f"torch verification failed: installed={info!r}; "
+            f"expected torch=={config.torch_version} and no torchcodec. "
+            "The project install re-introduced an incompatible torch/torchcodec; "
+            "delete .venv and .state/deps.done and rerun."
+        )
 
 
 def _popen_forward(cmd: list[str], env: dict) -> int:

@@ -1,5 +1,6 @@
 # Bootstrap-managed, machine-local artifacts — never committed.
 .uv/
+uv.lock
 .venv/
 .venv-test/
 .state/

@@ -271,6 +271,11 @@ class Engine:
                 try:
                     pcm = await self._infer_chunk(worker, audio_path, ref_text, chunk, params)
                 except InferenceError as exc:
+                    # Surface the *real* cause on stdout — otherwise the only
+                    # signal is the generic "rebuilt crashed worker" warning and
+                    # the underlying error (which lives in the HTTP 500 / job
+                    # state) is invisible to whoever watches the process.
+                    ndjson.log(f"inference failed: {exc}", level="warning")
                     # Isolate the crash: swap the dead worker for a fresh one so
                     # `finally` returns a healthy worker to the pool (SPEC §9).
                     worker = await self._rebuild_worker(worker)
@@ -305,7 +310,9 @@ class Engine:
                 params.speed,
             )
         except Exception as exc:  # noqa: BLE001 — isolate and surface as HTTP 500
-            raise InferenceError(str(exc)) from exc
+            # Keep the exception *type* in the message — some errors (e.g. bare
+            # ``RuntimeError()``) stringify to empty, leaving no clue what failed.
+            raise InferenceError(f"{type(exc).__name__}: {exc}") from exc
         return float_to_pcm16(wav)
 
     async def _rebuild_worker(self, dead: WorkerProtocol) -> WorkerProtocol:

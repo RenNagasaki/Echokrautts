@@ -26,4 +26,8 @@ if [ ! -x "$UV" ]; then
     fi
 fi
 
-exec "$UV" run --python 3.11 python "$SCRIPT_DIR/bootstrap.py" "$@"
+# --no-project is REQUIRED: cwd may be the wrapper dir (which has a pyproject.toml).
+# Without it, `uv run` treats that as a project and auto-syncs `.venv` from
+# pyproject (f5-tts → torch 2.12+cpu + torchcodec) *before* bootstrap.py runs,
+# clobbering the pinned torch (2.7.0+cu128, no torchcodec) step_deps installs.
+exec "$UV" run --no-project --python 3.11 python "$SCRIPT_DIR/bootstrap.py" "$@"
