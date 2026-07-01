@@ -25,6 +25,13 @@ def test_language_override_via_cli(tmp_path):
     assert cfg.language == "fr"
 
 
+def test_transformers_constraint_default_excludes_5x(tmp_path):
+    # XTTS needs isin_mps_friendly (gone in transformers 5.x); the default pin
+    # must keep the resolve on the 4.x line.
+    cfg = load_config(argv=[], config_path=tmp_path / "missing.json", env={})
+    assert cfg.transformers_constraint == "transformers>=4.57,<5"
+
+
 def test_tts_backend_default_and_overrides(tmp_path):
     cfg = load_config(argv=[], config_path=tmp_path / "missing.json", env={})
     assert cfg.tts_backend == "f5"  # F5 stays the default

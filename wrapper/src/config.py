@@ -40,6 +40,14 @@ class Config:
     # Bump deliberately and re-verify the soundfile path (SPEC §14.1).
     torch_version: str = "2.7.0"
     torchaudio_version: str = "2.7.0"
+    # coqui-tts (XTTS) imports `transformers.pytorch_utils.isin_mps_friendly`,
+    # which transformers REMOVED in 5.x. coqui-tts only declares `transformers>=
+    # 4.57` (no upper bound), so an unconstrained resolve picks 5.x and XTTS
+    # crashes on model-load ("cannot import name 'isin_mps_friendly'"). Pin to
+    # the last 4.x line (4.57.x still has the symbol AND satisfies >=4.57); f5-tts
+    # declares no transformers bound, so it accepts this too. Passed verbatim to
+    # `uv pip install` in step_deps and asserted by `_verify_transformers`.
+    transformers_constraint: str = "transformers>=4.57,<5"
     # TTS backend engine the worker pool loads at startup (one per process):
     #   "f5"   → F5-TTS finetunes (needs a ref-text per sample; CC-BY-NC weights)
     #   "xtts" → Coqui XTTS-v2 (clones from audio only, no ref-text; CPML weights)

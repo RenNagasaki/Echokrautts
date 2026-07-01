@@ -301,8 +301,16 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
     # AND the maintained coqui-tts fork (→ XTTS-v2), in a SINGLE uv resolution so
     # uv finds one mutually-compatible dependency set (or fails loudly) rather
     # than two sequential installs stomping each other's shared deps.
+    # The transformers constraint is part of the SAME resolution so uv picks a
+    # transformers that BOTH engines accept (XTTS needs a <5 build for
+    # `isin_mps_friendly`; coqui-tts's own `>=4.57` has no upper bound and would
+    # otherwise drag in a 5.x that crashes XTTS at model-load).
     ndjson.progress(index, TOTAL_STEPS, step, "Installiere Engine-Abhängigkeiten (F5 + XTTS) …", percent=50)
-    _run_uv(["pip", "install", "--python", py, str(WRAPPER_ROOT), "coqui-tts"], index, step)
+    _run_uv(
+        ["pip", "install", "--python", py,
+         str(WRAPPER_ROOT), "coqui-tts", config.transformers_constraint],
+        index, step,
+    )
 
     # The project deps (f5-tts, or coqui-tts for XTTS) can win the torch
     # resolution and pull a build that re-introduces the FFmpeg requirement via
@@ -324,6 +332,7 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
     # ``deps.done`` is NOT written and the next run rebuilds — never freeze a
     # broken venv behind the marker (SPEC §3 idempotency must not cache garbage).
     _verify_torch(py, config)
+    _verify_transformers(py)
 
     _mark_done(step)
     ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten installiert", done=True)
@@ -349,6 +358,24 @@ def _verify_torch(py: str, config) -> None:
             f"torch verification failed: installed={info!r}; "
             f"expected torch=={config.torch_version} and no torchcodec. "
             "The project install re-introduced an incompatible torch/torchcodec; "
+            "delete .venv and .state/deps.done and rerun."
+        )
+
+
+def _verify_transformers(py: str) -> None:
+    """Assert transformers still provides the symbol XTTS needs.
+
+    coqui-tts imports ``transformers.pytorch_utils.isin_mps_friendly``, removed in
+    transformers 5.x. If the resolve slipped a 5.x past the pin, XTTS would import
+    fine but crash at model-load — so fail HERE (before deps.done) so the next run
+    rebuilds instead of freezing a venv that only breaks when you pick the XTTS
+    backend (SPEC §3 idempotency must not cache a half-broken venv)."""
+    proc = procutil.run([py, "-c", "from transformers.pytorch_utils import isin_mps_friendly"])
+    if proc.returncode != 0:
+        raise FatalError(
+            "transformers verification failed: XTTS requires "
+            "transformers.pytorch_utils.isin_mps_friendly (removed in transformers "
+            "5.x). Constrain transformers<5 (config.transformers_constraint); "
             "delete .venv and .state/deps.done and rerun."
         )
 
