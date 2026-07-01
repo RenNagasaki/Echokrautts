@@ -2,8 +2,34 @@ import numpy as np
 import pytest
 
 from conftest import make_engine
-from src.engine import InferenceError, QueueFull, TtsParams, float_to_pcm16
+from src.config import Config
+from src.engine import InferenceError, QueueFull, TtsParams, _default_factory, float_to_pcm16
 from src.jobs import CANCELLED, DONE, ERROR
+
+
+def test_default_factory_defaults_to_f5():
+    # The default backend must remain F5; we only assert selection here (calling
+    # the closure would need f5-tts installed).
+    cfg = Config()
+    assert cfg.tts_backend == "f5"
+    assert callable(_default_factory(cfg))
+
+
+def test_default_factory_selects_xtts(monkeypatch):
+    from src import xtts_backend
+
+    made = {}
+
+    class FakeXTTS:
+        def __init__(self, config, device):
+            made["config"] = config
+            made["device"] = device
+
+    monkeypatch.setattr(xtts_backend, "XTTSWorker", FakeXTTS)
+    factory = _default_factory(Config(tts_backend="xtts"))
+    worker = factory(0, "cpu")
+    assert isinstance(worker, FakeXTTS)
+    assert made["device"] == "cpu"
 
 
 def test_float_to_pcm16_known_values():

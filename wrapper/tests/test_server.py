@@ -21,6 +21,7 @@ def test_health(client):
     assert body["status"] == "ok"
     assert body["backend"] == "cpu"
     assert body["language"] == "de"
+    assert body["tts_backend"] == "f5"
     assert body["workers"] >= 1
 
 

@@ -130,6 +130,17 @@ WorkerFactory = Callable[[int, str], WorkerProtocol]
 
 
 def _default_factory(config: Config) -> WorkerFactory:
+    # Pick the backend worker for this process (one backend per process, like
+    # language). XTTS is imported lazily so its heavy deps (coqui-tts) are only
+    # required when actually selected.
+    if config.tts_backend == "xtts":
+        def make_xtts(worker_id: int, device: str) -> WorkerProtocol:
+            from .xtts_backend import XTTSWorker  # lazy: coqui-tts/torch
+
+            return XTTSWorker(config, device)
+
+        return make_xtts
+
     def make(worker_id: int, device: str) -> WorkerProtocol:
         return F5TTSWorker(config, device)
 
@@ -219,6 +230,7 @@ class Engine:
         return {
             "status": "ok",
             "language": self._config.language,
+            "tts_backend": self._config.tts_backend,
             "backend": self.backend,
             "device": self.device,
             "workers": self.max_workers,

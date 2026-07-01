@@ -25,6 +25,15 @@ def test_language_override_via_cli(tmp_path):
     assert cfg.language == "fr"
 
 
+def test_tts_backend_default_and_overrides(tmp_path):
+    cfg = load_config(argv=[], config_path=tmp_path / "missing.json", env={})
+    assert cfg.tts_backend == "f5"  # F5 stays the default
+    cli = load_config(argv=["--tts-backend", "xtts"], config_path=tmp_path / "m.json", env={})
+    assert cli.tts_backend == "xtts"
+    envd = load_config(argv=[], config_path=tmp_path / "m.json", env={"F5W_TTS_BACKEND": "xtts"})
+    assert envd.tts_backend == "xtts"
+
+
 def test_languages_map_from_json(tmp_path):
     p = tmp_path / "config.json"
     p.write_text(

@@ -296,13 +296,19 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
 
     install_torch(10)
 
-    ndjson.progress(index, TOTAL_STEPS, step, "Installiere Wrapper-Abhängigkeiten …", percent=50)
-    _run_uv(["pip", "install", "--python", py, str(WRAPPER_ROOT)], index, step)
+    # Install ALL engines so the active one is chosen at start (--tts-backend),
+    # never re-installed on switch: the wrapper project (→ f5-tts + fastapi etc.)
+    # AND the maintained coqui-tts fork (→ XTTS-v2), in a SINGLE uv resolution so
+    # uv finds one mutually-compatible dependency set (or fails loudly) rather
+    # than two sequential installs stomping each other's shared deps.
+    ndjson.progress(index, TOTAL_STEPS, step, "Installiere Engine-Abhängigkeiten (F5 + XTTS) …", percent=50)
+    _run_uv(["pip", "install", "--python", py, str(WRAPPER_ROOT), "coqui-tts"], index, step)
 
-    # f5-tts declares a `torchcodec` dependency, which (a) can pull a torch build
-    # that re-introduces the FFmpeg requirement and (b) is unused — f5-tts loads
-    # audio via torchaudio.load (→ soundfile on the pinned 2.7.x). Re-pin torch to
-    # undo any bump from the project install, then drop the unused torchcodec.
+    # The project deps (f5-tts, or coqui-tts for XTTS) can win the torch
+    # resolution and pull a build that re-introduces the FFmpeg requirement via
+    # `torchcodec` (unused — audio loads via torchaudio.load → soundfile on the
+    # pinned 2.7.x). Re-pin torch to undo any bump from the deps install, then
+    # drop the unused torchcodec.
     install_torch(75)
     ndjson.progress(index, TOTAL_STEPS, step, "Entferne ungenutztes torchcodec …", percent=85)
     procutil.run([str(_uv_path()), "pip", "uninstall", "--python", py, "torchcodec"])
@@ -387,13 +393,18 @@ def step_model(config) -> None:
     if _is_done(step):
         ndjson.progress(index, TOTAL_STEPS, step, "Sprachmodelle vorhanden", skipped=True)
         return
-    # Download every configured language's checkpoint (en/de/fr/ja) so switching
-    # the active language later is just a restart with --language (SPEC §14.3).
-    ndjson.progress(index, TOTAL_STEPS, step, "Lade Sprachmodelle …", percent=0)
+    # Download the weights for ALL engines (chosen at start, not install):
+    #   F5   → every language's checkpoint (en/de/fr/ja), SPEC §14.3.
+    #   XTTS → the one multilingual XTTS-v2 model.
     env = _server_env(config)
+    ndjson.progress(index, TOTAL_STEPS, step, "Lade F5-Sprachmodelle …", percent=0)
     rc = _popen_forward([str(_venv_python()), "-m", "src.models"], env)
     if rc != 0:
-        raise FatalError("Modell-Download fehlgeschlagen (siehe stderr/Log)")
+        raise FatalError("F5-Modell-Download fehlgeschlagen (siehe stderr/Log)")
+    ndjson.progress(index, TOTAL_STEPS, step, "Lade XTTS-v2-Modell …", percent=60)
+    rc = _popen_forward([str(_venv_python()), "-m", "src.xtts_backend"], env)
+    if rc != 0:
+        raise FatalError("XTTS-Modell-Download fehlgeschlagen (siehe stderr/Log)")
     _mark_done(step)
     ndjson.progress(index, TOTAL_STEPS, step, "Sprachmodelle geladen", percent=100, done=True)
 
@@ -416,8 +427,13 @@ def _server_env(config) -> dict:
     # load_config) honors flags the host passed to bootstrap.py, e.g.
     # --language / --api-key, not just config.json defaults.
     env["F5W_LANGUAGE"] = config.language
+    env["F5W_TTS_BACKEND"] = config.tts_backend
     if config.api_key:
         env["F5W_API_KEY"] = config.api_key
+    # Both engines are installed; the XTTS env is harmless for the F5 backend.
+    # Accept the CPML non-interactively and keep XTTS weights under models/.
+    env["COQUI_TOS_AGREED"] = "1"
+    env["TTS_HOME"] = str(config.models_path)
     return env
 
 

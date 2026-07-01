@@ -40,6 +40,12 @@ class Config:
     # Bump deliberately and re-verify the soundfile path (SPEC §14.1).
     torch_version: str = "2.7.0"
     torchaudio_version: str = "2.7.0"
+    # TTS backend engine the worker pool loads at startup (one per process):
+    #   "f5"   → F5-TTS finetunes (needs a ref-text per sample; CC-BY-NC weights)
+    #   "xtts" → Coqui XTTS-v2 (clones from audio only, no ref-text; CPML weights)
+    # The bootstrap installs BOTH engines + all their models, so switching is a
+    # restart with a different --tts-backend (no reinstall). See xtts_backend.py.
+    tts_backend: str = "f5"
     # Active language at startup; selects which model the worker pool loads.
     # The per-request ``language`` field must match this (or be omitted).
     language: str = "de"
