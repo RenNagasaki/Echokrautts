@@ -91,6 +91,10 @@ class Config:
     per_job_gb: float = 3.0
     max_queue: int = 64
     max_chars_per_chunk: int = 250
+    # XTTS token-streaming granularity: audio tokens per streamed chunk handed to
+    # `inference_stream` (lower = lower first-audio latency, slightly more
+    # overhead). XTTS default is 20. F5 has no token streaming and ignores this.
+    stream_chunk_size: int = 20
     asr_for_missing_ref_text: bool = True
     allowed_sample_ext: list[str] = field(
         default_factory=lambda: [".wav", ".flac", ".mp3"]
@@ -137,7 +141,7 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
     # Choose the target type from the dataclass default when current is None.
     if name in ("parent_pid", "max_workers"):
         return None if raw == "" or raw.lower() == "null" else int(raw)
-    if name in ("port", "max_queue", "max_chars_per_chunk"):
+    if name in ("port", "max_queue", "max_chars_per_chunk", "stream_chunk_size"):
         return int(raw)
     if name in ("vram_reserve_gb", "per_job_gb"):
         return float(raw)

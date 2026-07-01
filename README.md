@@ -79,8 +79,11 @@ backend. Both engines are installed by the bootstrap, so switching is only a res
 | `f5`   | F5-TTS finetunes (per language) | needed — from a sidecar `.txt`, the request's `ref_text`, or auto-transcribed via F5's built-in ASR | code MIT, weights CC-BY-NC |
 | `xtts` | Coqui XTTS-v2 (one multilingual model) | **not needed** — clones from the audio alone | code MPL-2.0, weights CPML (non-commercial) |
 
-Both output mono `pcm_s16le` at 24000 Hz, so the HTTP contract is identical. XTTS is served via the
-maintained [`coqui-tts`](https://github.com/idiap/coqui-ai-TTS) fork (the original `TTS` package is
+Both output mono `pcm_s16le` at 24000 Hz, so the HTTP contract is identical. `f5` emits one PCM
+block per sentence; `xtts` does **token streaming** (`inference_stream`), emitting many smaller PCM
+parts as they are generated for much lower first-audio latency (`stream_chunk_size` tunes the
+granularity, default 20). XTTS is served via the maintained
+[`coqui-tts`](https://github.com/idiap/coqui-ai-TTS) fork (the original `TTS` package is
 unmaintained). See [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for the full license matrix.
 
 ## Languages

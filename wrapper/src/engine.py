@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Callable, Optional, Protocol
+from typing import AsyncIterator, Callable, Iterator, Optional, Protocol
 
 import numpy as np
 
@@ -55,15 +55,25 @@ class TtsParams:
 class WorkerProtocol(Protocol):
     sample_rate: int
     device: str
+    # Whether the worker can stream a chunk incrementally via ``infer_stream``
+    # (token streaming, e.g. XTTS). False → the engine uses the one-shot
+    # ``infer`` path (e.g. F5, which returns a whole clip). Accessed via getattr
+    # so workers/fakes that omit it default to False.
+    supports_streaming: bool
 
     def infer(self, ref_file: str, ref_text: str, gen_text: str, nfe_step: int, speed: float) -> np.ndarray: ...
     def transcribe(self, audio_path: Path) -> str: ...
     def self_test(self) -> bool: ...
+    # Optional (only when supports_streaming): yield float32 audio chunks as they
+    # are generated for a single text chunk.
+    def infer_stream(self, ref_file: str, ref_text: str, gen_text: str, speed: float) -> Iterator[np.ndarray]: ...
 
 
 # --------------------------------------------------------------- real worker
 class F5TTSWorker:
     """Wraps a single ``f5_tts.api.F5TTS`` instance bound to one device."""
+
+    supports_streaming = False  # F5's infer() returns a whole clip, not a stream
 
     def __init__(self, config: Config, device: str):
         from f5_tts.api import F5TTS  # lazy: heavy import
@@ -153,6 +163,22 @@ def float_to_pcm16(wav: np.ndarray) -> bytes:
     arr = np.asarray(wav, dtype=np.float32)
     arr = np.clip(arr, -1.0, 1.0)
     return (arr * 32767.0).astype("<i2").tobytes()
+
+
+# Sentinel returned by _pump_next when a streaming worker's generator is done.
+_STREAM_DONE = object()
+
+
+def _pump_next(gen: Iterator[np.ndarray]) -> object:
+    """Pull one item from a sync generator, returning ``_STREAM_DONE`` at the end.
+
+    Runs in the thread executor (like ``infer``) so a blocking chunk synthesis
+    never stalls the event loop, and so token streaming crosses the sync→async
+    boundary one chunk at a time without a queue/threadsafe dance."""
+    try:
+        return next(gen)
+    except StopIteration:
+        return _STREAM_DONE
 
 
 # -------------------------------------------------------------------- engine
@@ -276,12 +302,24 @@ class Engine:
             worker = await self._free.get()  # waits if all workers busy
             self._jobs.mark_running(job, id(worker))
 
+            streaming = getattr(worker, "supports_streaming", False)
             for chunk in chunks:
                 if job.cancelled:
                     self._jobs.finish(job, CANCELLED)
                     return
                 try:
-                    pcm = await self._infer_chunk(worker, audio_path, ref_text, chunk, params)
+                    if streaming:
+                        # Token streaming (XTTS): emit PCM parts as they are
+                        # produced, checking cancel between parts so a cancelled
+                        # long sentence stops mid-flight.
+                        async for pcm in self._stream_chunk(worker, audio_path, ref_text, chunk, params):
+                            if job.cancelled:
+                                self._jobs.finish(job, CANCELLED)
+                                return
+                            yield pcm
+                    else:
+                        # One-shot (F5): whole sentence synthesized, then emitted.
+                        yield await self._infer_chunk(worker, audio_path, ref_text, chunk, params)
                 except InferenceError as exc:
                     # Surface the *real* cause on stdout — otherwise the only
                     # signal is the generic "rebuilt crashed worker" warning and
@@ -294,7 +332,6 @@ class Engine:
                     self._jobs.finish(job, ERROR, str(exc))
                     raise
                 self._jobs.advance(job)
-                yield pcm
 
             self._jobs.finish(job, DONE)
         finally:
@@ -326,6 +363,35 @@ class Engine:
             # ``RuntimeError()``) stringify to empty, leaving no clue what failed.
             raise InferenceError(f"{type(exc).__name__}: {exc}") from exc
         return float_to_pcm16(wav)
+
+    async def _stream_chunk(
+        self,
+        worker: WorkerProtocol,
+        audio_path: Path,
+        ref_text: Optional[str],
+        chunk: str,
+        params: TtsParams,
+    ) -> AsyncIterator[bytes]:
+        """Yield PCM parts as a streaming worker generates a single text chunk.
+
+        The worker's ``infer_stream`` is a *sync* generator run on a compute
+        device; each item is pulled in the thread executor (:func:`_pump_next`)
+        so the event loop never blocks. Any failure — building the generator or
+        producing a part — is surfaced as :class:`InferenceError` so the caller
+        rebuilds the worker exactly like the one-shot path."""
+        assert self._loop is not None
+        try:
+            gen = worker.infer_stream(str(audio_path), ref_text or "", chunk, params.speed)
+        except Exception as exc:  # noqa: BLE001 — isolate and surface as HTTP 500
+            raise InferenceError(f"{type(exc).__name__}: {exc}") from exc
+        while True:
+            try:
+                part = await self._loop.run_in_executor(None, _pump_next, gen)
+            except Exception as exc:  # noqa: BLE001
+                raise InferenceError(f"{type(exc).__name__}: {exc}") from exc
+            if part is _STREAM_DONE:
+                return
+            yield float_to_pcm16(part)  # type: ignore[arg-type]
 
     async def _rebuild_worker(self, dead: WorkerProtocol) -> WorkerProtocol:
         """Replace a crashed worker instance in place, returning the fresh one.

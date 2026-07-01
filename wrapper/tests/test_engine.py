@@ -83,6 +83,59 @@ async def test_queue_full(config):
 
 
 @pytest.mark.asyncio
+async def test_token_streaming_yields_parts_per_sentence(config):
+    # A streaming worker (XTTS-like) emits several PCM parts per sentence,
+    # finer-grained than the one-shot path — but job progress still advances
+    # per sentence.
+    config.max_chars_per_chunk = 5  # force "Eins." / "Zwei." into 2 chunks
+    engine = make_engine(config, streaming=True)
+    await engine.start()
+    job = engine._jobs.create()
+    params = TtsParams(sample="anna_de.wav", text="Eins. Zwei.")  # 2 chunks
+    path = engine.samples.resolve_path("anna_de.wav")
+    engine.admit()
+
+    chunks = [c async for c in engine.stream(job, params, path)]
+    # 2 chunks × 3 parts each — streaming granularity is finer than chunks.
+    assert len(chunks) == 2 * 3
+    assert all(isinstance(c, (bytes, bytearray)) and len(c) > 0 for c in chunks)
+    assert job.state == DONE
+    assert job.sentences_done == job.sentences_total == 2
+
+
+@pytest.mark.asyncio
+async def test_streaming_cancel_between_parts(config):
+    engine = make_engine(config, streaming=True)
+    await engine.start()
+    job = engine._jobs.create()
+    job.cancel_event.set()  # cancelled before the first part
+    params = TtsParams(sample="anna_de.wav", text="Eins. Zwei.")
+    path = engine.samples.resolve_path("anna_de.wav")
+    engine.admit()
+
+    chunks = [c async for c in engine.stream(job, params, path)]
+    assert chunks == []
+    assert job.state == CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_streaming_inference_error_rebuilds_worker(config):
+    engine = make_engine(config, fail=True, streaming=True)
+    await engine.start()
+    job = engine._jobs.create()
+    params = TtsParams(sample="anna_de.wav", text="Hallo.")
+    path = engine.samples.resolve_path("anna_de.wav")
+    engine.admit()
+
+    with pytest.raises(InferenceError):
+        async for _ in engine.stream(job, params, path):
+            pass
+    assert job.state == ERROR
+    assert engine.queue_depth == 0
+    assert engine._free.qsize() == 1
+
+
+@pytest.mark.asyncio
 async def test_inference_error_rebuilds_worker(config):
     engine = make_engine(config, fail=True)
     await engine.start()

@@ -24,6 +24,8 @@ from src.jobs import JobRegistry  # noqa: E402
 class FakeWorker:
     """A stand-in for F5TTSWorker that yields a fixed silent clip."""
 
+    supports_streaming = False
+
     def __init__(self, sample_rate: int = 24000, fail: bool = False):
         self.sample_rate = sample_rate
         self.device = "cpu"
@@ -43,6 +45,21 @@ class FakeWorker:
 
     def self_test(self):
         return True
+
+
+class FakeStreamWorker(FakeWorker):
+    """A stand-in for XTTSWorker: streams a fixed number of tiny PCM parts."""
+
+    supports_streaming = True
+    PARTS_PER_CHUNK = 3
+
+    def infer_stream(self, ref_file, ref_text, gen_text, speed):
+        self.infer_calls += 1
+        if self._fail:
+            raise RuntimeError("simulated CUDA OOM")
+        n = max(1, int(0.02 * self.sample_rate))
+        for _ in range(self.PARTS_PER_CHUNK):
+            yield np.zeros(n, dtype=np.float32)
 
 
 def cpu_detection(max_workers_hint: int = 1) -> Detection:
@@ -72,12 +89,15 @@ def config(tmp_path: Path, samples_dir: Path) -> Config:
     )
 
 
-def make_engine(config: Config, *, fail: bool = False, workers: int = 1) -> Engine:
+def make_engine(
+    config: Config, *, fail: bool = False, workers: int = 1, streaming: bool = False
+) -> Engine:
     jobs = JobRegistry()
     det = cpu_detection(max_workers_hint=workers)
+    worker_cls = FakeStreamWorker if streaming else FakeWorker
     return Engine(
         config,
         det,
         jobs,
-        worker_factory=lambda i, d: FakeWorker(fail=fail),
+        worker_factory=lambda i, d: worker_cls(fail=fail),
     )

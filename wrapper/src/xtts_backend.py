@@ -55,6 +55,8 @@ def _resolve_model_dir(config: Config) -> str:
 class XTTSWorker:
     """Wraps a single Coqui ``Xtts`` model bound to one device and language."""
 
+    supports_streaming = True  # XTTS exposes token streaming via inference_stream
+
     def __init__(self, config: Config, device: str):
         import torch  # noqa: F401  lazy: heavy import (ensures torch is present)
         from TTS.tts.configs.xtts_config import XttsConfig
@@ -62,6 +64,7 @@ class XTTSWorker:
 
         self.device = device
         self.sample_rate = DEFAULT_SAMPLE_RATE
+        self._stream_chunk_size = config.stream_chunk_size
         # One language per process (like the F5 backend); XTTS takes ISO codes
         # (en/de/fr/ja) that match the wrapper's language keys directly.
         self._lang = config.language
@@ -104,6 +107,28 @@ class XTTSWorker:
             enable_text_splitting=False,
         )
         return np.asarray(out["wav"], dtype=np.float32)
+
+    def infer_stream(self, ref_file: str, ref_text: str, gen_text: str, speed: float):
+        """Yield float32 audio chunks as XTTS generates them (token streaming).
+
+        Lower first-audio latency than :meth:`infer`: audio starts flowing before
+        the whole chunk is synthesized. The engine pumps this sync generator one
+        item at a time in a thread. ``ref_text`` is ignored (XTTS clones from the
+        audio alone)."""
+        gpt_cond_latent, speaker_embedding = self._conditioning(ref_file)
+        for wav_chunk in self._model.inference_stream(
+            gen_text,
+            self._lang,
+            gpt_cond_latent,
+            speaker_embedding,
+            speed=speed,
+            enable_text_splitting=False,
+            stream_chunk_size=self._stream_chunk_size,
+        ):
+            # XTTS yields torch tensors on the compute device; move to a flat
+            # CPU float32 array for float_to_pcm16.
+            arr = wav_chunk.detach().to("cpu").numpy() if hasattr(wav_chunk, "detach") else np.asarray(wav_chunk)
+            yield np.asarray(arr, dtype=np.float32).reshape(-1)
 
     def transcribe(self, audio_path: Path) -> str:
         # XTTS clones from the reference audio directly; it never needs the
