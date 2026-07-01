@@ -61,12 +61,12 @@ class WorkerProtocol(Protocol):
     # so workers/fakes that omit it default to False.
     supports_streaming: bool
 
-    def infer(self, ref_file: str, ref_text: str, gen_text: str, nfe_step: int, speed: float) -> np.ndarray: ...
+    def infer(self, ref_file: str, ref_text: str, gen_text: str, nfe_step: int, speed: float, language: Optional[str] = None) -> np.ndarray: ...
     def transcribe(self, audio_path: Path) -> str: ...
     def self_test(self) -> bool: ...
     # Optional (only when supports_streaming): yield float32 audio chunks as they
     # are generated for a single text chunk.
-    def infer_stream(self, ref_file: str, ref_text: str, gen_text: str, speed: float) -> Iterator[np.ndarray]: ...
+    def infer_stream(self, ref_file: str, ref_text: str, gen_text: str, speed: float, language: Optional[str] = None) -> Iterator[np.ndarray]: ...
 
 
 # --------------------------------------------------------------- real worker
@@ -97,7 +97,10 @@ class F5TTSWorker:
         if isinstance(sr, int) and sr > 0:
             self.sample_rate = sr
 
-    def infer(self, ref_file: str, ref_text: str, gen_text: str, nfe_step: int, speed: float) -> np.ndarray:
+    def infer(self, ref_file: str, ref_text: str, gen_text: str, nfe_step: int, speed: float, language: Optional[str] = None) -> np.ndarray:
+        # ``language`` is ignored: an F5 worker is bound to one finetune at load
+        # time (one language per process), and the server already rejects a
+        # mismatched request before it reaches here. Accepted for protocol parity.
         wav, sr, _spec = self._model.infer(
             ref_file=ref_file,
             ref_text=ref_text or "",
@@ -357,6 +360,7 @@ class Engine:
                 chunk,
                 params.nfe_step,
                 params.speed,
+                params.language,
             )
         except Exception as exc:  # noqa: BLE001 — isolate and surface as HTTP 500
             # Keep the exception *type* in the message — some errors (e.g. bare
@@ -381,7 +385,7 @@ class Engine:
         rebuilds the worker exactly like the one-shot path."""
         assert self._loop is not None
         try:
-            gen = worker.infer_stream(str(audio_path), ref_text or "", chunk, params.speed)
+            gen = worker.infer_stream(str(audio_path), ref_text or "", chunk, params.speed, params.language)
         except Exception as exc:  # noqa: BLE001 — isolate and surface as HTTP 500
             raise InferenceError(f"{type(exc).__name__}: {exc}") from exc
         while True:

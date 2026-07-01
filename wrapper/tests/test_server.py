@@ -30,10 +30,49 @@ def test_tts_language_match_ok(client):
     assert r.status_code == 200
 
 
-def test_tts_language_mismatch_rejected(client):
-    r = client.post("/tts", json={"sample": "anna_de.wav", "text": "Hallo.", "language": "en"})
-    assert r.status_code == 400
-    assert "language" in r.json()["detail"]
+def test_tts_f5_ignores_request_language(config):
+    # F5 loads one finetune per process → a mismatched request language is not
+    # rejected; it's ignored and the loaded (startup) model is used regardless.
+    engine = make_engine(config)  # default tts_backend="f5"
+    app = create_app(config=config, engine=engine)
+    with TestClient(app) as c:
+        r = c.post("/tts", json={"sample": "anna_de.wav", "text": "Hallo.", "language": "en"})
+        assert r.status_code == 200
+    # The worker (bound to the loaded model) is invoked with the startup language.
+    assert engine._workers[0].languages == ["de"]
+
+
+def test_tts_xtts_accepts_per_request_language(config):
+    # XTTS is multilingual in one model → a per-request language is honored
+    # (no reload) and forwarded to the worker verbatim.
+    config.tts_backend = "xtts"
+    engine = make_engine(config)
+    app = create_app(config=config, engine=engine)
+    with TestClient(app) as c:
+        r = c.post("/tts", json={"sample": "anna_de.wav", "text": "Hello.", "language": "en"})
+        assert r.status_code == 200
+    assert engine._workers[0].languages == ["en"]
+
+
+def test_tts_xtts_omitted_language_uses_startup(config):
+    config.tts_backend = "xtts"
+    engine = make_engine(config)
+    app = create_app(config=config, engine=engine)
+    with TestClient(app) as c:
+        r = c.post("/tts", json={"sample": "anna_de.wav", "text": "Hallo."})
+        assert r.status_code == 200
+    # Falls back to the active/startup language (de).
+    assert engine._workers[0].languages == ["de"]
+
+
+def test_tts_xtts_unsupported_language_rejected(config):
+    config.tts_backend = "xtts"
+    engine = make_engine(config)
+    app = create_app(config=config, engine=engine)
+    with TestClient(app) as c:
+        r = c.post("/tts", json={"sample": "anna_de.wav", "text": "x", "language": "xx"})
+        assert r.status_code == 400
+        assert "not supported" in r.json()["detail"]
 
 
 def test_samples_list(client):

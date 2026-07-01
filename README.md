@@ -88,9 +88,12 @@ unmaintained). See [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for the 
 
 ## Languages
 
-A wrapper process serves **one language**, chosen at startup via `language` (config) or
-`--language <code>`. For the `f5` backend each language maps to a distinct model in the `languages`
-config block; the `xtts` backend covers all of them with its single multilingual model.
+Every request may carry a `language` field; how it is treated depends on the backend. `f5` serves
+**one language per process**, chosen at startup via `language` (config) or `--language <code>`, with
+each language mapping to a distinct model in the `languages` config block. `xtts` covers all
+languages with its **single multilingual model**, so the per-request `language` picks the target
+language on the fly — **no restart or reload**. Omitting `language` falls back to the startup
+language in both cases.
 
 | Lang | F5 model | Source |
 |------|----------|--------|
@@ -100,12 +103,14 @@ config block; the `xtts` backend covers all of them with its single multilingual
 | `ja` | `F5TTS_Base` finetune | `Jmica/F5TTS` (CC-BY-NC) |
 
 The bootstrap **downloads all four** F5 checkpoints (and the XTTS-v2 model) at install time, so
-switching language or backend is just a restart with a different `--language` / `--tts-backend` (no
-re-download). `GET /health` reports the active language. A `/tts` request whose `language` field
-doesn't match the loaded language is rejected with `400` (prevents synthesizing in the wrong
-accent). Provide a **reference sample in the target language** (and, for `f5`, ideally a matching
-`.txt` transcript) for best results. To add/replace an F5 language, edit the `languages` map in
-`wrapper/config.json` (verify repo + file names against F5-TTS `SHARED.md`).
+switching the F5 language (or the backend) is just a restart with a different `--language` /
+`--tts-backend` (no re-download). `GET /health` reports the startup language. Language handling is
+backend-aware: on `f5`, a per-request `language` is **ignored** — the loaded/startup model is always
+used (F5 can only voice its one finetune); on `xtts`, any of its supported codes
+(`en es fr de it pt pl tr ru nl cs ar zh-cn ja hu ko hi`) is accepted per request and an unsupported
+code returns `400`. Provide a **reference sample in the target language** (and, for `f5`, ideally a
+matching `.txt` transcript) for best results. To add/replace an F5 language, edit the `languages`
+map in `wrapper/config.json` (verify repo + file names against F5-TTS `SHARED.md`).
 
 ## Development
 

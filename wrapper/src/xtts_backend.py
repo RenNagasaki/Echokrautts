@@ -34,6 +34,17 @@ from .config import Config, load_config
 XTTS_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
 DEFAULT_SAMPLE_RATE = 24000  # XTTS-v2 output rate
 
+# ISO codes XTTS-v2 accepts at inference. Unlike F5 (one finetune per language,
+# fixed at startup), XTTS is natively multilingual — so the per-request
+# ``language`` selects the target language with NO model reload. Superset of the
+# wrapper's en/de/fr/ja language map; the server validates requests against this.
+XTTS_LANGUAGES = frozenset(
+    {
+        "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl",
+        "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi",
+    }
+)
+
 
 def _resolve_model_dir(config: Config) -> str:
     """Download (or reuse the cache for) the XTTS-v2 model directory.
@@ -94,13 +105,23 @@ class XTTSWorker:
         self._cond_cache[ref_file] = latents
         return latents
 
-    def infer(self, ref_file: str, ref_text: str, gen_text: str, nfe_step: int, speed: float) -> np.ndarray:
+    def infer(
+        self,
+        ref_file: str,
+        ref_text: str,
+        gen_text: str,
+        nfe_step: int,
+        speed: float,
+        language: str | None = None,
+    ) -> np.ndarray:
         # ref_text / nfe_step are F5 concepts; XTTS ignores them (clones from
-        # the audio directly and has no NFE steps).
+        # the audio directly and has no NFE steps). ``language`` selects the
+        # target language per request (XTTS is multilingual → no reload); falls
+        # back to the startup language when omitted.
         gpt_cond_latent, speaker_embedding = self._conditioning(ref_file)
         out = self._model.inference(
             gen_text,
-            self._lang,
+            language or self._lang,
             gpt_cond_latent,
             speaker_embedding,
             speed=speed,
@@ -108,17 +129,25 @@ class XTTSWorker:
         )
         return np.asarray(out["wav"], dtype=np.float32)
 
-    def infer_stream(self, ref_file: str, ref_text: str, gen_text: str, speed: float):
+    def infer_stream(
+        self,
+        ref_file: str,
+        ref_text: str,
+        gen_text: str,
+        speed: float,
+        language: str | None = None,
+    ):
         """Yield float32 audio chunks as XTTS generates them (token streaming).
 
         Lower first-audio latency than :meth:`infer`: audio starts flowing before
         the whole chunk is synthesized. The engine pumps this sync generator one
         item at a time in a thread. ``ref_text`` is ignored (XTTS clones from the
-        audio alone)."""
+        audio alone); ``language`` selects the target language per request (no
+        reload), defaulting to the startup language when omitted."""
         gpt_cond_latent, speaker_embedding = self._conditioning(ref_file)
         for wav_chunk in self._model.inference_stream(
             gen_text,
-            self._lang,
+            language or self._lang,
             gpt_cond_latent,
             speaker_embedding,
             speed=speed,

@@ -35,6 +35,30 @@ class TtsRequest(BaseModel):
     nfe_step: int = 32
 
 
+def _resolve_language(config: Config, requested: Optional[str]) -> str:
+    """Pick the effective synthesis language, backend-aware (SPEC §5).
+
+    XTTS is natively multilingual in one model → any language it supports is
+    accepted per request (no reload); an unsupported code is a clean 400 rather
+    than a deep 500 from inside XTTS. F5 loads one finetune per process, so it
+    can only voice its loaded language → a per-request ``language`` is ignored
+    (the loaded model is used regardless), never rejected. Omitting ``language``
+    always falls back to the wrapper's active/startup language.
+    """
+    if config.tts_backend == "xtts" and requested:
+        from .xtts_backend import XTTS_LANGUAGES
+
+        if requested not in XTTS_LANGUAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"language '{requested}' is not supported by XTTS "
+                f"(supported: {', '.join(sorted(XTTS_LANGUAGES))})",
+            )
+        return requested
+    # F5 (or XTTS without a request language): use the loaded/startup language.
+    return config.language
+
+
 def _require_api_key(config: Config):
     """Build a dependency enforcing a Bearer key iff one is configured (SPEC §5)."""
 
@@ -149,14 +173,11 @@ def create_app(
     @app.post("/tts", dependencies=[Depends(api_key_dep)])
     async def tts(req: TtsRequest, request: Request):
         eng: Engine = _engine(request)
-        # The wrapper loads one language at startup; reject mismatched requests
-        # rather than silently synthesizing in the wrong voice/accent.
-        if req.language and req.language != config.language:
-            raise HTTPException(
-                status_code=400,
-                detail=f"wrapper loaded for language '{config.language}', "
-                f"request asked for '{req.language}'",
-            )
+        # Resolve the effective language. XTTS is multilingual in a single model,
+        # so a per-request language just selects the target — no reload. F5 loads
+        # one finetune per process, so it ignores the request language and uses
+        # its loaded model.
+        language = _resolve_language(config, req.language)
         # Validate + admit BEFORE the 200 stream starts, so error codes are real.
         try:
             audio_path = eng.samples.resolve_path(req.sample)
@@ -173,7 +194,7 @@ def create_app(
         params = TtsParams(
             sample=req.sample,
             text=req.text,
-            language=req.language,
+            language=language,
             ref_text=req.ref_text,
             speed=req.speed,
             nfe_step=req.nfe_step,

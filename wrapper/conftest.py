@@ -31,9 +31,11 @@ class FakeWorker:
         self.device = "cpu"
         self._fail = fail
         self.infer_calls = 0
+        self.languages: list = []  # every language passed to infer/infer_stream
 
-    def infer(self, ref_file, ref_text, gen_text, nfe_step, speed):
+    def infer(self, ref_file, ref_text, gen_text, nfe_step, speed, language=None):
         self.infer_calls += 1
+        self.languages.append(language)
         if self._fail:
             raise RuntimeError("simulated CUDA OOM")
         # 50 ms of silence, length proportional to text so output varies.
@@ -53,8 +55,9 @@ class FakeStreamWorker(FakeWorker):
     supports_streaming = True
     PARTS_PER_CHUNK = 3
 
-    def infer_stream(self, ref_file, ref_text, gen_text, speed):
+    def infer_stream(self, ref_file, ref_text, gen_text, speed, language=None):
         self.infer_calls += 1
+        self.languages.append(language)
         if self._fail:
             raise RuntimeError("simulated CUDA OOM")
         n = max(1, int(0.02 * self.sample_rate))

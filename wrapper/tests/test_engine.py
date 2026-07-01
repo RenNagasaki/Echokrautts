@@ -104,6 +104,22 @@ async def test_token_streaming_yields_parts_per_sentence(config):
 
 
 @pytest.mark.asyncio
+async def test_language_forwarded_to_worker(config):
+    # The per-request language reaches the worker on both the one-shot and the
+    # streaming path (XTTS uses it to pick the target language, no reload).
+    for streaming in (False, True):
+        engine = make_engine(config, streaming=streaming)
+        await engine.start()
+        job = engine._jobs.create()
+        params = TtsParams(sample="anna_de.wav", text="Hallo.", language="fr")
+        path = engine.samples.resolve_path("anna_de.wav")
+        engine.admit()
+
+        _ = [c async for c in engine.stream(job, params, path)]
+        assert engine._workers[0].languages == ["fr"]
+
+
+@pytest.mark.asyncio
 async def test_streaming_cancel_between_parts(config):
     engine = make_engine(config, streaming=True)
     await engine.start()
