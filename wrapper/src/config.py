@@ -28,7 +28,9 @@ ENV_PREFIX = "F5W_"
 class Config:
     """Resolved runtime configuration. All SPEC §10 keys plus a few extras."""
 
-    host: str = "127.0.0.1"
+    # Bind on all interfaces by default so the host/plugin reaches it without any
+    # config edit. Set an api_key (or narrow host to 127.0.0.1) to lock it down.
+    host: str = "0.0.0.0"
     port: int = 8765
     parent_pid: Optional[int] = None
     api_key: Optional[str] = None
