@@ -62,8 +62,9 @@ torchcodec. Bump the pins deliberately and re-verify the soundfile path if you c
 | `POST /shutdown`     | Graceful shutdown.                                                 |
 
 Configuration lives in `wrapper/config.json` (overridable by `F5W_*` env vars and `--kebab-case` CLI
-flags; precedence JSON < ENV < CLI). For remote use set `host` to `0.0.0.0` and an `api_key` (then
-all requests need `Authorization: Bearer <key>`).
+flags; precedence JSON < ENV < CLI). The server **binds `0.0.0.0` by default** so the host reaches it
+with no config edit; this also exposes it on your LAN, so set an `api_key` (then all requests need
+`Authorization: Bearer <key>`) — or narrow `host` back to `127.0.0.1` — if that isn't what you want.
 
 ## Voice samples
 
