@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import ndjson
+from . import ndjson, progress
 from .config import Config, load_config
 
 # Coqui model id for XTTS-v2 (multilingual, multi-dataset).
@@ -182,10 +182,18 @@ class XTTSWorker:
 
 
 def download_model(config: Config) -> None:
-    """Pre-download XTTS-v2 at install time. Idempotent (see resolver)."""
+    """Pre-download XTTS-v2 at install time. Idempotent (see resolver).
+
+    Coqui's ``ModelManager`` fetches several files (model, config, vocab,
+    speakers) — each is reported as a per-file ``progress`` bar via the tqdm
+    hook in :mod:`src.progress`, on top of the coarse start/done ``log`` lines.
+    """
     config.models_path.mkdir(parents=True, exist_ok=True)
+    mp = progress.ModelProgress()
+    mp.stage("XTTS-v2: ")
     ndjson.log("Lade XTTS-v2-Modell …")
-    _resolve_model_dir(config)
+    with mp.patch():
+        _resolve_model_dir(config)
     ndjson.log("XTTS-v2-Modell bereit")
 
 

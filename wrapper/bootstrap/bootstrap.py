@@ -424,6 +424,10 @@ def step_model(config) -> None:
     #   F5   → every language's checkpoint (en/de/fr/ja), SPEC §14.3.
     #   XTTS → the one multilingual XTTS-v2 model.
     env = _server_env(config)
+    # Let the download sub-processes emit their per-file progress bars onto THIS
+    # same "Step 5/6 · model" bar (src.progress.ModelProgress reads these).
+    env["F5W_STEP_INDEX"] = str(index)
+    env["F5W_STEP_TOTAL"] = str(TOTAL_STEPS)
     ndjson.progress(index, TOTAL_STEPS, step, "Lade F5-Sprachmodelle …", percent=0)
     rc = _popen_forward([str(_venv_python()), "-m", "src.models"], env)
     if rc != 0:

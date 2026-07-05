@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from . import ndjson
+from . import ndjson, progress
 from .config import Config, load_config
 
 
@@ -71,19 +71,27 @@ def download_all(config: Config) -> None:
     """Pre-download the checkpoints for every configured language (install time).
 
     Idempotent: HuggingFace caching means re-runs are fast. Each language is
-    reported as an NDJSON ``log`` line so the host can show per-model progress.
+    reported as an NDJSON ``log`` line (start/done) plus per-file ``progress``
+    events with a live percentage, via the tqdm hook in :mod:`src.progress`.
     """
     config.models_path.mkdir(parents=True, exist_ok=True)
-    for lang, entry in config.languages.items():
-        ndjson.log(f"Lade Modell '{lang}' …")
-        if entry.get("hf_repo"):
-            resolve_model(config, lang)
-        else:
-            # Base model: instantiate F5-TTS to trigger its own weight download.
-            from f5_tts.api import F5TTS  # lazy
+    mp = progress.ModelProgress()
+    # One patch around the whole loop: huggingface_hub binds its tqdm reference
+    # on first import, so re-patching per language would leave later languages
+    # reporting under the first one's label. Instead the subclass reads the
+    # current label from ``mp`` (set per language via ``stage``).
+    with mp.patch():
+        for lang, entry in config.languages.items():
+            mp.stage(f"{lang}: ")
+            ndjson.log(f"Lade Modell '{lang}' …")
+            if entry.get("hf_repo"):
+                resolve_model(config, lang)
+            else:
+                # Base model: instantiate F5-TTS to trigger its own weight download.
+                from f5_tts.api import F5TTS  # lazy
 
-            F5TTS(model=entry.get("arch", "F5TTS_v1_Base"), hf_cache_dir=str(config.models_path))
-        ndjson.log(f"Modell '{lang}' bereit")
+                F5TTS(model=entry.get("arch", "F5TTS_v1_Base"), hf_cache_dir=str(config.models_path))
+            ndjson.log(f"Modell '{lang}' bereit")
 
 
 if __name__ == "__main__":
