@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 # A single lock so concurrent threads (worker pool, watchdog, request handlers)
@@ -23,6 +24,10 @@ _lock = threading.Lock()
 
 
 def _write(obj: dict[str, Any]) -> None:
+    # Stamp every event with a UTC ISO-8601 timestamp (millisecond precision) so
+    # the host can measure when things happen — e.g. per-request timing. Additive
+    # and never overrides an explicit ``ts`` a caller already set.
+    obj.setdefault("ts", datetime.now(timezone.utc).isoformat(timespec="milliseconds"))
     line = json.dumps(obj, ensure_ascii=False)
     with _lock:
         # Reconfigure lazily in case the parent did not set PYTHONUTF8.

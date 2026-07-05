@@ -18,6 +18,7 @@ package — and the unit test suite — import without those heavy deps installe
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Callable, Iterator, Optional, Protocol
@@ -300,6 +301,16 @@ class Engine:
         chunks = chunk_text(params.text, self._config.max_chars_per_chunk)
         self._jobs.set_total(job, len(chunks))
 
+        ndjson.log(
+            f"tts request start: job={job.job_id} sample={params.sample} "
+            f"lang={params.language} chars={len(params.text)} chunks={len(chunks)}"
+        )
+        # Wall clock for the whole synthesis + total PCM emitted, so we can report
+        # generation time, audio length, and the real-time factor (efficiency) at
+        # the end of a completed request.
+        started = time.monotonic()
+        total_bytes = 0
+
         worker: Optional[WorkerProtocol] = None
         try:
             worker = await self._free.get()  # waits if all workers busy
@@ -319,10 +330,13 @@ class Engine:
                             if job.cancelled:
                                 self._jobs.finish(job, CANCELLED)
                                 return
+                            total_bytes += len(pcm)
                             yield pcm
                     else:
                         # One-shot (F5): whole sentence synthesized, then emitted.
-                        yield await self._infer_chunk(worker, audio_path, ref_text, chunk, params)
+                        pcm = await self._infer_chunk(worker, audio_path, ref_text, chunk, params)
+                        total_bytes += len(pcm)
+                        yield pcm
                 except InferenceError as exc:
                     # Surface the *real* cause on stdout — otherwise the only
                     # signal is the generic "rebuilt crashed worker" warning and
@@ -337,10 +351,29 @@ class Engine:
                 self._jobs.advance(job)
 
             self._jobs.finish(job, DONE)
+            self._log_timing(job, worker, started, total_bytes)
         finally:
             if worker is not None:
                 self._free.put_nowait(worker)
             self._pending -= 1
+
+    def _log_timing(
+        self, job: Job, worker: WorkerProtocol, started: float, total_bytes: int
+    ) -> None:
+        """Emit a one-line efficiency summary for a completed request (SPEC §8.1).
+
+        Reports how long generation took, how much audio was produced, and the
+        real-time factor (generation ÷ audio; < 1.0 means faster than real time)
+        so the user can gauge how efficiently the engine runs. PCM is 16-bit mono,
+        so 2 bytes per sample."""
+        gen_s = time.monotonic() - started
+        sr = getattr(worker, "sample_rate", 0) or DEFAULT_SAMPLE_RATE
+        audio_s = (total_bytes / 2) / sr if sr else 0.0
+        rtf = gen_s / audio_s if audio_s > 0 else 0.0
+        ndjson.log(
+            f"tts request done: job={job.job_id} generated={gen_s:.2f}s "
+            f"audio={audio_s:.2f}s rtf={rtf:.2f}"
+        )
 
     async def _infer_chunk(
         self,

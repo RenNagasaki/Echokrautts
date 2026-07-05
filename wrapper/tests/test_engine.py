@@ -58,6 +58,33 @@ async def test_stream_produces_pcm_and_completes(config):
 
 
 @pytest.mark.asyncio
+async def test_stream_emits_request_timing_logs(config, monkeypatch):
+    # A completed request logs a start line and a done line with generation
+    # time, audio length, and the real-time factor (efficiency).
+    from src import engine as engine_mod
+
+    logs: list[str] = []
+    monkeypatch.setattr(engine_mod.ndjson, "log", lambda msg, level="info": logs.append(msg))
+
+    config.max_chars_per_chunk = 5  # force "Eins." / "Zwei." into 2 chunks
+    engine = make_engine(config)
+    await engine.start()
+    job = engine._jobs.create()
+    params = TtsParams(sample="anna_de.wav", text="Eins. Zwei.")
+    path = engine.samples.resolve_path("anna_de.wav")
+    engine.admit()
+
+    _ = [c async for c in engine.stream(job, params, path)]
+
+    start = next(m for m in logs if m.startswith("tts request start:"))
+    done = next(m for m in logs if m.startswith("tts request done:"))
+    assert f"job={job.job_id}" in start and "sample=anna_de.wav" in start
+    assert "generated=" in done and "audio=" in done and "rtf=" in done
+    # Two sentences × 50 ms of fake silence → ~0.10 s of audio reported.
+    assert "audio=0.10s" in done
+
+
+@pytest.mark.asyncio
 async def test_cancel_before_first_chunk(config):
     engine = make_engine(config)
     await engine.start()
