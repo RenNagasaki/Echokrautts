@@ -50,6 +50,28 @@ binaries**. The TTS engines declare `torchcodec` as a dependency but never impor
 `torchaudio.load`), so the bootstrap re-pins torch after the deps install and drops the unused
 torchcodec. Bump the pins deliberately and re-verify the soundfile path if you change them.
 
+## Hardware / GPU acceleration
+
+The bootstrap **detects your hardware** (the "detect GPU" step) and installs the matching torch wheel
++ device automatically — no configuration needed. What you actually get:
+
+| Hardware | Windows | Linux |
+|----------|---------|-------|
+| **NVIDIA** | ✅ CUDA (cu128 for Blackwell/sm≥12, else cu126) | ✅ CUDA |
+| **AMD** | ⚠️ DirectML detected, but op coverage is insufficient → **falls back to CPU** | ✅ ROCm (reported as a CUDA device) |
+| **Intel dGPU** | ⚠️ XPU detected, but XTTS maps it to CPU and F5 self-tests → typically **CPU** | ⚠️ same |
+| **No GPU / other** | 🐢 CPU | 🐢 CPU |
+
+- **Both backends run on any of these** — the question is only *how fast*. On CPU (incl. AMD-on-Windows
+  and Intel) expect real-time factor **> 1** (slower than real time): fine for testing, too slow for
+  live in-game TTS.
+- **Real AMD acceleration is Linux-only** (ROCm). There is no ROCm PyTorch for Windows, and DirectML
+  can't run the ops these models need — so an AMD card on Windows serves on the CPU.
+- For fragile devices (dml/xpu) the engine runs a tiny **self-test** at startup and rebuilds the worker
+  pool on CPU if it fails, so you always get working audio, just not always on the GPU.
+- The **`xtts_fp16`** speedup applies only where the device is CUDA (NVIDIA or ROCm); see
+  [TTS backends](#tts-backends).
+
 ## HTTP API
 
 | Method & path        | Purpose                                                            |
