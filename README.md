@@ -56,7 +56,7 @@ torchcodec. Bump the pins deliberately and re-verify the soundfile path if you c
 | Method & path        | Purpose                                                            |
 |----------------------|--------------------------------------------------------------------|
 | `POST /tts`          | Streaming synthesis. Body = raw PCM (`pcm_s16le`, mono). Metadata in `X-Job-Id` / `X-Sample-Rate` / `X-Channels` / `X-Sample-Format` headers. |
-| `GET /samples`       | Usable voice-sample names (`?details=true` adds `has_ref_text`/`bytes`). |
+| `GET /samples`       | Usable voice names (`?details=true` adds `has_ref_text`/`bytes`/`count`). |
 | `POST /cancel/{id}`  | Cancel a running job.                                              |
 | `GET /jobs/{id}`     | Live progress (`sentences_done`/`sentences_total`/`percent`).      |
 | `GET /health`        | Backend/device/worker/queue status.                               |
@@ -68,9 +68,18 @@ all requests need `Authorization: Bearer <key>`).
 
 ## Voice samples
 
-Drop `*.wav`/`*.flac`/`*.mp3` files into `wrapper/samples/`. Requests reference a sample by
-**basename only** (path traversal is rejected). For the `f5` backend a reference transcript is taken
-from a sidecar `<name>.txt`, else the request's `ref_text`, else auto-transcribed via F5-TTS's
+Drop `*.wav`/`*.flac`/`*.mp3` files into `wrapper/samples/`. A voice can be either:
+
+* a **single audio file** — `samples/Alphinaud.wav`, or
+* a **voice folder** — `samples/Alphinaud/` holding several clips of the *same* voice. One clip is
+  picked **at random per request** so repeated lines vary naturally. Folders are **one level only**
+  (sub-directories are ignored) and a folder **shadows** a same-named single file
+  (`samples/Alphinaud/` wins over `samples/Alphinaud.wav`).
+
+Requests reference a voice by **basename only** (path traversal is rejected); the extension is
+**ignored** — `Alphinaud`, `Alphinaud.wav` and `Alphinaud.mp3` all resolve to the same voice. For the
+`f5` backend a reference transcript is taken, for the *chosen* clip, from a sidecar `<clip>.txt`
+(optional, same name as the audio), else the request's `ref_text`, else auto-transcribed via F5-TTS's
 built-in ASR and cached. The `xtts` backend needs no transcript (it clones from the audio alone).
 
 ## TTS backends
