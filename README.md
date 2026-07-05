@@ -14,17 +14,22 @@ The wrapper lives in [`wrapper/`](wrapper/); the full specification is in
 ## Quick start
 
 The simplest entry point is the one-click launcher in the repo root — it fetches `uv`, installs
-everything on first run, then serves:
+everything on first run, then serves. There is one launcher pair per TTS backend:
 
 ```bash
-start.bat            # Windows (visible window, pauses at the end)
-./start.sh           # Linux/macOS
+start-f5tts.bat      # Windows, F5-TTS backend (visible window, pauses at the end)
+./start-f5tts.sh     # Linux/macOS, F5-TTS backend
+start-xtts.bat       # Windows, XTTS-v2 backend
+./start-xtts.sh      # Linux/macOS, XTTS-v2 backend
 ```
 
-Both forward extra arguments, e.g. `start.bat --tts-backend xtts --language en`.
+Both engines and all their weights are installed either way; the launcher only picks (via
+`--tts-backend f5` / `--tts-backend xtts`) which engine the worker pool loads at startup, so
+switching is a restart, not a reinstall. All launchers forward extra arguments, e.g.
+`start-xtts.bat --language en`.
 
 Under the hood these call `wrapper/bootstrap/install_win.ps1` / `install_linux.sh` (which fetch `uv`)
-with `--start`. A host process that already has a Python can run the bootstrap directly:
+with `--start --tts-backend <…>`. A host process that already has a Python can run the bootstrap directly:
 
 ```bash
 python wrapper/bootstrap/bootstrap.py --start --parent-pid <host_pid>
