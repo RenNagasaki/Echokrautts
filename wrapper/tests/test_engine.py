@@ -1,10 +1,28 @@
 import numpy as np
 import pytest
 
-from conftest import make_engine
+from conftest import FakeWorker, make_engine
 from src.config import Config
-from src.engine import InferenceError, QueueFull, TtsParams, _default_factory, float_to_pcm16
-from src.jobs import CANCELLED, DONE, ERROR
+from src.engine import Engine, InferenceError, QueueFull, TtsParams, _default_factory, float_to_pcm16
+from src.gpu_detect import Detection
+from src.jobs import CANCELLED, DONE, ERROR, JobRegistry
+
+
+def _engine_on(config: Config, device: str) -> Engine:
+    det = Detection(backend=device, device=device, torch_index_url="x", max_workers_hint=1)
+    return Engine(config, det, JobRegistry(), worker_factory=lambda i, d: FakeWorker())
+
+
+def test_health_reports_effective_xtts_fp16():
+    # Enabled + xtts + CUDA → effective.
+    on = _engine_on(Config(tts_backend="xtts", xtts_fp16=True), "cuda")
+    assert on.health()["xtts_fp16"] is True
+    # Same flag but CPU device → not effective.
+    cpu = _engine_on(Config(tts_backend="xtts", xtts_fp16=True), "cpu")
+    assert cpu.health()["xtts_fp16"] is False
+    # f5 backend ignores the flag entirely, even on CUDA.
+    f5 = _engine_on(Config(tts_backend="f5", xtts_fp16=True), "cuda")
+    assert f5.health()["xtts_fp16"] is False
 
 
 def test_default_factory_defaults_to_f5():

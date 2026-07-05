@@ -46,6 +46,16 @@ XTTS_LANGUAGES = frozenset(
 )
 
 
+def _should_use_fp16(config: Config, device: str) -> bool:
+    """Whether to load the XTTS model in half precision.
+
+    Only on CUDA (NVIDIA or ROCm, both reported as ``"cuda"``) and only when
+    ``config.xtts_fp16`` is set. fp16 on CPU is unsupported/slower, and dml/xpu
+    are mapped to CPU by the worker — so pass the *resolved* device here.
+    """
+    return bool(config.xtts_fp16) and device == "cuda"
+
+
 def _resolve_model_dir(config: Config) -> str:
     """Download (or reuse the cache for) the XTTS-v2 model directory.
 
@@ -89,7 +99,14 @@ class XTTSWorker:
             xtts_config, checkpoint_dir=model_dir, eval=True, use_deepspeed=False
         )
         # XTTS has no DirectML/XPU path; those fall back to CPU (engine self-test).
-        model.to("cpu" if device in ("dml", "xpu") else device)
+        resolved_device = "cpu" if device in ("dml", "xpu") else device
+        model.to(resolved_device)
+        # Optional fp16 speedup — CUDA only (see _should_use_fp16). The inference
+        # outputs are cast back to float32 for PCM, so the HTTP contract is intact.
+        self._fp16 = _should_use_fp16(config, resolved_device)
+        if self._fp16:
+            model.half()
+            ndjson.log(f"XTTS fp16 enabled on {resolved_device}")
         self._model = model
 
         sr = getattr(getattr(xtts_config, "audio", None), "output_sample_rate", None)

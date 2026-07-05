@@ -17,6 +17,18 @@ def test_module_imports_without_heavy_deps():
     assert xtts_backend.DEFAULT_SAMPLE_RATE == 24000
 
 
+def test_should_use_fp16_only_on_cuda_when_enabled():
+    on = Config(xtts_fp16=True)
+    off = Config(xtts_fp16=False)
+    # Enabled + CUDA → yes.
+    assert xtts_backend._should_use_fp16(on, "cuda") is True
+    # Enabled but non-CUDA (cpu/dml/xpu resolve to cpu) → no.
+    assert xtts_backend._should_use_fp16(on, "cpu") is False
+    assert xtts_backend._should_use_fp16(on, "xpu") is False
+    # Disabled → never, even on CUDA.
+    assert xtts_backend._should_use_fp16(off, "cuda") is False
+
+
 def test_download_model_uses_resolver(tmp_path, monkeypatch):
     cfg = Config(models_dir=str(tmp_path / "models"))
     seen = []

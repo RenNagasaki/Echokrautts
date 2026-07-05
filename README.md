@@ -96,7 +96,10 @@ backend. Both engines are installed by the bootstrap, so switching is only a res
 Both output mono `pcm_s16le` at 24000 Hz, so the HTTP contract is identical. `f5` emits one PCM
 block per sentence; `xtts` does **token streaming** (`inference_stream`), emitting many smaller PCM
 parts as they are generated for much lower first-audio latency (`stream_chunk_size` tunes the
-granularity, default 20). XTTS is served via the maintained
+granularity, default 20). For extra XTTS throughput, set `xtts_fp16: true` to load the model in
+**half precision** (~1.3–1.8× faster) — it is opt-in, applied **only on a CUDA GPU** (NVIDIA/ROCm;
+ignored on CPU/dml/xpu), and experimental, so verify each voice still sounds right. `GET /health`
+reports the effective `xtts_fp16` state. XTTS is served via the maintained
 [`coqui-tts`](https://github.com/idiap/coqui-ai-TTS) fork (the original `TTS` package is
 unmaintained). See [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for the full license matrix.
 

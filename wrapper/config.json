@@ -20,6 +20,7 @@
   "per_job_gb": 3.0,
   "max_queue": 64,
   "max_chars_per_chunk": 250,
+  "xtts_fp16": false,
   "asr_for_missing_ref_text": true,
   "allowed_sample_ext": [".wav", ".flac", ".mp3"],
   "hf_endpoint": null,

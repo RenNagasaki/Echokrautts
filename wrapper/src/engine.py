@@ -263,6 +263,12 @@ class Engine:
             "tts_backend": self._config.tts_backend,
             "backend": self.backend,
             "device": self.device,
+            # Effective XTTS fp16 state: opt-in flag AND xtts backend AND CUDA.
+            "xtts_fp16": (
+                self._config.tts_backend == "xtts"
+                and bool(self._config.xtts_fp16)
+                and self.device == "cuda"
+            ),
             "workers": self.max_workers,
             "queue": self.queue_depth,
         }

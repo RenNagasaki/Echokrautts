@@ -97,6 +97,11 @@ class Config:
     # `inference_stream` (lower = lower first-audio latency, slightly more
     # overhead). XTTS default is 20. F5 has no token streaming and ignores this.
     stream_chunk_size: int = 20
+    # Load the XTTS model in half precision (fp16) for a ~1.3-1.8x inference
+    # speedup on a GPU. Opt-in (default off) and **only applied on a CUDA device**
+    # (covers NVIDIA and ROCm; ignored on CPU/dml/xpu, where fp16 is unsupported
+    # or slower). F5 ignores this. Experimental — verify audio quality per voice.
+    xtts_fp16: bool = False
     asr_for_missing_ref_text: bool = True
     allowed_sample_ext: list[str] = field(
         default_factory=lambda: [".wav", ".flac", ".mp3"]
@@ -147,7 +152,7 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
         return int(raw)
     if name in ("vram_reserve_gb", "per_job_gb"):
         return float(raw)
-    if name == "asr_for_missing_ref_text":
+    if name in ("asr_for_missing_ref_text", "xtts_fp16"):
         low = raw.lower()
         if low in _BOOL_TRUE:
             return True

@@ -32,6 +32,17 @@ def test_stream_chunk_size_default_and_coercion(tmp_path):
     assert over.stream_chunk_size == 40 and isinstance(over.stream_chunk_size, int)
 
 
+def test_xtts_fp16_default_and_coercion(tmp_path):
+    cfg = load_config(argv=[], config_path=tmp_path / "missing.json", env={})
+    assert cfg.xtts_fp16 is False
+    # ENV string coerces to bool.
+    env_on = load_config(argv=[], config_path=tmp_path / "m.json", env={"F5W_XTTS_FP16": "true"})
+    assert env_on.xtts_fp16 is True
+    # CLI flag overrides.
+    cli_on = load_config(argv=["--xtts-fp16", "1"], config_path=tmp_path / "m.json", env={})
+    assert cli_on.xtts_fp16 is True
+
+
 def test_transformers_constraint_default_excludes_5x(tmp_path):
     # XTTS needs isin_mps_friendly (gone in transformers 5.x); the default pin
     # must keep the resolve on the 4.x line.

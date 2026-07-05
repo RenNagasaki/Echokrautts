@@ -22,6 +22,7 @@ def test_health(client):
     assert body["backend"] == "cpu"
     assert body["language"] == "de"
     assert body["tts_backend"] == "f5"
+    assert body["xtts_fp16"] is False  # default off, f5 backend, cpu device
     assert body["workers"] >= 1
 
 
