@@ -7,8 +7,7 @@ over stdout (NDJSON events) and HTTP (streaming PCM). It provides zero-shot voic
 sentence-level streaming, a VRAM-aware worker pool, and self-contained installation via
 [`uv`](https://github.com/astral-sh/uv) — no system Python or git required.
 
-The wrapper lives in [`wrapper/`](wrapper/); the full specification is in
-[`F5-TTS-Wrapper-SPEC.md`](F5-TTS-Wrapper-SPEC.md), and the licenses of everything it installs are in
+The wrapper lives in [`wrapper/`](wrapper/), and the licenses of everything it installs are in
 [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
 
 ## Quick start
