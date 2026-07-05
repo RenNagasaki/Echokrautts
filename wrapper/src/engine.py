@@ -303,7 +303,8 @@ class Engine:
 
         ndjson.log(
             f"tts request start: job={job.job_id} sample={params.sample} "
-            f"lang={params.language} chars={len(params.text)} chunks={len(chunks)}"
+            f"file={audio_path.name} lang={params.language} "
+            f"chars={len(params.text)} chunks={len(chunks)}"
         )
         # Wall clock for the whole synthesis + total PCM emitted, so we can report
         # generation time, audio length, and the real-time factor (efficiency) at
