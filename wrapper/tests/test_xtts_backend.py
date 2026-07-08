@@ -40,6 +40,28 @@ def test_download_model_uses_resolver(tmp_path, monkeypatch):
     assert cfg.models_path.exists()  # download_model ensures the dir exists
 
 
+def test_custom_xtts_model_dir_wins(tmp_path):
+    # A full XTTS model dir (config.json + a weight file) short-circuits the
+    # base-model download entirely.
+    cfg = Config(models_dir=str(tmp_path / "models"))
+    custom = cfg.custom_model_path
+    custom.mkdir(parents=True)
+    (custom / "config.json").write_text("{}", encoding="utf-8")
+    (custom / "model.pth").write_bytes(b"weights")
+
+    assert xtts_backend._resolve_model_dir(cfg) == str(custom)
+
+
+def test_custom_xtts_ignored_without_config(tmp_path):
+    # A bare checkpoint (F5-style, no config.json) is NOT an XTTS model dir.
+    cfg = Config(models_dir=str(tmp_path / "models"))
+    custom = cfg.custom_model_path
+    custom.mkdir(parents=True)
+    (custom / "model.safetensors").write_bytes(b"weights")
+
+    assert xtts_backend._resolve_custom_model_dir(cfg) is None
+
+
 def test_resolve_model_dir_downloads_and_accepts_license(tmp_path, monkeypatch):
     cfg = Config(models_dir=str(tmp_path / "models"))
 

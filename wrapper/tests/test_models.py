@@ -48,6 +48,51 @@ def test_unknown_language_raises():
         models.resolve_model(Config(), "xx")
 
 
+def test_custom_model_absent_returns_none(tmp_path):
+    cfg = Config(models_dir=str(tmp_path / "m"))
+    assert models.resolve_custom_model(cfg) is None
+
+
+def test_custom_model_overrides_active_language(tmp_path, fake_hf):
+    cfg = Config(models_dir=str(tmp_path / "m"), language="de")
+    custom = cfg.custom_model_path
+    custom.mkdir(parents=True)
+    (custom / "model.safetensors").write_bytes(b"weights")
+
+    rm = models.resolve_model(cfg)  # active language = de
+    assert rm.ckpt_file.endswith("model.safetensors")
+    assert rm.arch == "F5TTS_Base"  # default when no arch.txt
+    assert rm.vocab_file == ""      # no vocab.txt present
+    assert fake_hf == []            # custom wins → no HF download
+
+
+def test_custom_model_honors_arch_and_vocab(tmp_path):
+    cfg = Config(models_dir=str(tmp_path / "m"), language="de")
+    custom = cfg.custom_model_path
+    custom.mkdir(parents=True)
+    (custom / "model.pt").write_bytes(b"weights")
+    (custom / "vocab.txt").write_text("a b c", encoding="utf-8")
+    (custom / "arch.txt").write_text("F5TTS_v1_Base\n", encoding="utf-8")
+
+    rm = models.resolve_custom_model(cfg)
+    assert rm.arch == "F5TTS_v1_Base"
+    assert rm.ckpt_file.endswith("model.pt")
+    assert rm.vocab_file.endswith("vocab.txt")
+
+
+def test_custom_model_not_used_for_non_active_language(tmp_path, fake_hf):
+    # Custom model installed, but a resolve for a DIFFERENT language than the
+    # active one must still use that language's HuggingFace mapping.
+    cfg = Config(models_dir=str(tmp_path / "m"), language="de")
+    custom = cfg.custom_model_path
+    custom.mkdir(parents=True)
+    (custom / "model.safetensors").write_bytes(b"weights")
+
+    rm = models.resolve_model(cfg, "fr")
+    assert any(repo == "RASPIAUDIO/F5-French-MixedSpeakers-reduced" for repo, _ in fake_hf)
+    assert not rm.ckpt_file.endswith("echokraut_custom" + "/model.safetensors")
+
+
 def test_download_all_covers_every_language(monkeypatch, fake_hf, tmp_path):
     # Fake the base-model class so the "en" branch doesn't import real f5_tts.
     f5mod = types.ModuleType("f5_tts")

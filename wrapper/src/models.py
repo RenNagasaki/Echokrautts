@@ -19,6 +19,7 @@ and F5-TTS imports are lazy so this module imports without those heavy deps.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from . import ndjson, progress
@@ -42,13 +43,59 @@ def language_entry(config: Config, language: Optional[str] = None) -> dict:
     return entry
 
 
+# F5 checkpoint extensions in priority order. XTTS uses ``model.pth`` (a different
+# extension) + a ``config.json``, so a custom XTTS model directory never matches
+# here — the two backends can share the same custom-model folder safely.
+_F5_CKPT_EXTS = (".safetensors", ".pt", ".ckpt")
+
+
+def resolve_custom_model(config: Config) -> Optional[ResolvedModel]:
+    """A user-supplied F5 finetune dropped into ``models/echokraut_custom/``.
+
+    Returns a :class:`ResolvedModel` with local checkpoint/vocab paths when the
+    folder holds a usable F5 checkpoint, else ``None``. The checkpoint is the
+    first match of ``*.safetensors`` → ``*.pt`` → ``*.ckpt`` (sorted). ``vocab.txt``
+    is used if present; ``arch.txt`` (single line) overrides the architecture
+    (default ``F5TTS_Base``, the arch most community finetunes use).
+    """
+    d = config.custom_model_path
+    if not d.is_dir():
+        return None
+    ckpt: Optional[str] = None
+    for ext in _F5_CKPT_EXTS:
+        matches = sorted(d.glob(f"*{ext}"))
+        if matches:
+            ckpt = str(matches[0])
+            break
+    if ckpt is None:
+        return None
+    vocab = d / "vocab.txt"
+    arch_file = d / "arch.txt"
+    arch = arch_file.read_text(encoding="utf-8").strip() if arch_file.is_file() else ""
+    ndjson.log(f"Nutze eigenes F5-Modell: {Path(ckpt).name}")
+    return ResolvedModel(
+        arch=arch or "F5TTS_Base",
+        ckpt_file=ckpt,
+        vocab_file=str(vocab) if vocab.is_file() else "",
+    )
+
+
 def resolve_model(config: Config, language: Optional[str] = None) -> ResolvedModel:
     """Resolve a language to a concrete (arch, checkpoint, vocab).
+
+    A user-supplied custom finetune (``models/echokraut_custom/``) overrides the
+    configured model, but only for the ACTIVE language — pre-download of the other
+    languages keeps using their HuggingFace mapping.
 
     For finetunes this downloads (or reuses the cache for) the checkpoint and
     vocab via ``hf_hub_download`` and returns local file paths. For the base
     model it returns empty paths so F5-TTS handles the download itself.
     """
+    if (language or config.language) == config.language:
+        custom = resolve_custom_model(config)
+        if custom is not None:
+            return custom
+
     entry = language_entry(config, language)
     arch = entry.get("arch", "F5TTS_v1_Base")
     repo = entry.get("hf_repo")

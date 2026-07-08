@@ -56,14 +56,37 @@ def _should_use_fp16(config: Config, device: str) -> bool:
     return bool(config.xtts_fp16) and device == "cuda"
 
 
+def _resolve_custom_model_dir(config: Config) -> str | None:
+    """A user-supplied XTTS model dropped into ``models/echokraut_custom/``.
+
+    Returns the directory when it looks like a full XTTS-v2 model (a
+    ``config.json`` plus a ``model.pth``/``model.safetensors`` weight file),
+    else ``None``. F5 finetunes ship a bare checkpoint with no ``config.json``,
+    so the two backends can share the same custom-model folder safely.
+    """
+    d = config.custom_model_path
+    if (d / "config.json").is_file() and (
+        (d / "model.pth").is_file() or (d / "model.safetensors").is_file()
+    ):
+        ndjson.log(f"Nutze eigenes XTTS-Modell: {d}")
+        return str(d)
+    return None
+
+
 def _resolve_model_dir(config: Config) -> str:
     """Download (or reuse the cache for) the XTTS-v2 model directory.
 
-    Idempotent: Coqui's :class:`ModelManager` skips the download when the files
-    already exist under ``models/``. Returns the local model directory path.
-    Used by BOTH the bootstrap (install-time preload) and the worker (load) —
-    single source of truth, mirroring ``models.resolve_model`` for F5.
+    A user-supplied custom model (``models/echokraut_custom/``) wins over the
+    base download. Otherwise, idempotent: Coqui's :class:`ModelManager` skips the
+    download when the files already exist under ``models/``. Returns the local
+    model directory path. Used by BOTH the bootstrap (install-time preload) and
+    the worker (load) — single source of truth, mirroring ``models.resolve_model``
+    for F5.
     """
+    custom = _resolve_custom_model_dir(config)
+    if custom is not None:
+        return custom
+
     # Accept the CPML non-interactively so the download never blocks on a prompt.
     os.environ.setdefault("COQUI_TOS_AGREED", "1")
     from TTS.utils.manage import ModelManager  # lazy: heavy import

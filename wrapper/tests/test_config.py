@@ -120,3 +120,8 @@ def test_path_resolution_relative_and_absolute(tmp_path):
 def test_normalized_exts():
     cfg = Config(allowed_sample_ext=["WAV", ".Flac"])
     assert cfg.normalized_exts == {".wav", ".flac"}
+
+
+def test_custom_model_path_under_models(tmp_path):
+    cfg = Config(models_dir=str(tmp_path / "abs"))
+    assert cfg.custom_model_path == tmp_path / "abs" / "echokraut_custom"
