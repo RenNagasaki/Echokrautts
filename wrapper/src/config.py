@@ -23,6 +23,14 @@ DEFAULT_CONFIG_PATH = WRAPPER_ROOT / "config.json"
 
 ENV_PREFIX = "F5W_"
 
+# Sub-directory of ``models/`` where a user-supplied custom model is dropped (by
+# the host's "install custom data" flow). When present it overrides the
+# configured model for the ACTIVE engine at load time — F5 finetune (a bare
+# checkpoint + optional vocab.txt/arch.txt) for the f5 backend, a full XTTS-v2
+# model directory (config.json + model.pth/…) for the xtts backend. See
+# ``models.resolve_model`` / ``xtts_backend._resolve_model_dir``.
+CUSTOM_MODEL_DIRNAME = "echokraut_custom"
+
 
 @dataclass
 class Config:
@@ -122,6 +130,11 @@ class Config:
     @property
     def models_path(self) -> Path:
         return self._resolve(self.models_dir)
+
+    @property
+    def custom_model_path(self) -> Path:
+        """Directory a user-installed custom model lives in (may not exist)."""
+        return self.models_path / CUSTOM_MODEL_DIRNAME
 
     def _resolve(self, value: str) -> Path:
         p = Path(value)
