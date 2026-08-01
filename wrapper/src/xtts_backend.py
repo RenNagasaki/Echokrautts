@@ -56,6 +56,49 @@ def _should_use_fp16(config: Config, device: str) -> bool:
     return bool(config.xtts_fp16) and device == "cuda"
 
 
+# Submodules that are fed tensors derived **directly from the reference audio**
+# (raw waveform / mel), which the TTS library always produces as float32 and
+# never casts. Under a blanket ``model.half()`` they would see float32 input
+# against half weights → ``RuntimeError: Input type (torch.cuda.FloatTensor) and
+# weight type (torch.cuda.HalfTensor) should be the same`` inside
+# ``get_conditioning_latents`` (speaker encoder first, then the GPT style
+# encoder). They are tiny and run once per reference sample (result cached), so
+# keeping them in float32 costs nothing measurable; the latents they produce are
+# cast to half in :meth:`XTTSWorker._conditioning` before they enter the model.
+FP16_FLOAT32_MODULES = (
+    "hifigan_decoder.speaker_encoder",  # get_speaker_embedding(audio_16k)
+    "gpt.conditioning_encoder",  # gpt.get_style_emb(mel)
+    "gpt.conditioning_perceiver",  # only when use_perceiver_resampler
+)
+
+
+def _module_by_path(model, path: str):
+    """``getattr`` chain, ``None`` if any step is missing (library drift)."""
+    obj = model
+    for part in path.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def _apply_fp16(model) -> list[str]:
+    """Half-precision the model, keeping the reference-audio front-end float32.
+
+    Returns the module paths that were kept in float32 (for logging/tests).
+    Missing paths are skipped so a coqui-tts version that renames a submodule
+    degrades to "may crash again" rather than "crashes at load".
+    """
+    model.half()
+    kept: list[str] = []
+    for path in FP16_FLOAT32_MODULES:
+        module = _module_by_path(model, path)
+        if module is not None and hasattr(module, "float"):
+            module.float()
+            kept.append(path)
+    return kept
+
+
 def _resolve_custom_model_dir(config: Config) -> str | None:
     """A user-supplied XTTS model dropped into ``models/echokraut_custom/``.
 
@@ -130,8 +173,11 @@ class XTTSWorker:
         # outputs are cast back to float32 for PCM, so the HTTP contract is intact.
         self._fp16 = _should_use_fp16(config, resolved_device)
         if self._fp16:
-            model.half()
-            ndjson.log_once(f"XTTS fp16 enabled on {resolved_device}")
+            kept = _apply_fp16(model)
+            ndjson.log_once(
+                f"XTTS fp16 enabled on {resolved_device} "
+                f"(float32 kept for: {', '.join(kept) if kept else 'nothing'})"
+            )
         self._model = model
 
         sr = getattr(getattr(xtts_config, "audio", None), "output_sample_rate", None)
@@ -139,11 +185,18 @@ class XTTSWorker:
             self.sample_rate = sr
 
     def _conditioning(self, ref_file: str) -> tuple:
-        """(gpt_cond_latent, speaker_embedding) for a sample, cached by path."""
+        """(gpt_cond_latent, speaker_embedding) for a sample, cached by path.
+
+        Under fp16 the latents come out of the float32 front-end (see
+        :data:`FP16_FLOAT32_MODULES`) and must be cast to half before they meet
+        the half-precision GPT / vocoder at inference time.
+        """
         cached = self._cond_cache.get(ref_file)
         if cached is not None:
             return cached
         latents = self._model.get_conditioning_latents(audio_path=[ref_file])
+        if self._fp16:
+            latents = tuple(t.half() if hasattr(t, "half") else t for t in latents)
         self._cond_cache[ref_file] = latents
         return latents
 

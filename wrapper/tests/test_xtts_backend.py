@@ -29,6 +29,105 @@ def test_should_use_fp16_only_on_cuda_when_enabled():
     assert xtts_backend._should_use_fp16(off, "cuda") is False
 
 
+class _FakeModule:
+    """Stands in for an nn.Module: records half()/float() calls."""
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def half(self):
+        self.calls.append("half")
+        return self
+
+    def float(self):
+        self.calls.append("float")
+        return self
+
+
+class _FakeXtts(_FakeModule):
+    def __init__(self, perceiver=True):
+        super().__init__()
+        self.hifigan_decoder = types.SimpleNamespace(speaker_encoder=_FakeModule())
+        gpt = types.SimpleNamespace(conditioning_encoder=_FakeModule())
+        if perceiver:
+            gpt.conditioning_perceiver = _FakeModule()
+        self.gpt = gpt
+
+
+def test_apply_fp16_keeps_reference_audio_frontend_in_float32():
+    # Regression: a blanket model.half() crashed get_conditioning_latents with
+    # "Input type (torch.cuda.FloatTensor) and weight type (torch.cuda.HalfTensor)"
+    # because the library feeds those modules float32 audio/mel it never casts.
+    model = _FakeXtts()
+
+    kept = xtts_backend._apply_fp16(model)
+
+    assert model.calls == ["half"]  # the model as a whole goes half
+    assert kept == [
+        "hifigan_decoder.speaker_encoder",
+        "gpt.conditioning_encoder",
+        "gpt.conditioning_perceiver",
+    ]
+    assert model.hifigan_decoder.speaker_encoder.calls == ["float"]
+    assert model.gpt.conditioning_encoder.calls == ["float"]
+    assert model.gpt.conditioning_perceiver.calls == ["float"]
+
+
+def test_apply_fp16_skips_missing_submodules():
+    # A coqui-tts version without the perceiver resampler must not blow up at load.
+    model = _FakeXtts(perceiver=False)
+
+    kept = xtts_backend._apply_fp16(model)
+
+    assert "gpt.conditioning_perceiver" not in kept
+    assert model.calls == ["half"]
+
+
+class _FakeLatent:
+    def __init__(self, dtype="float32"):
+        self.dtype = dtype
+
+    def half(self):
+        return _FakeLatent("float16")
+
+
+def _worker_stub(model, fp16):
+    worker = object.__new__(xtts_backend.XTTSWorker)
+    worker._model = model
+    worker._fp16 = fp16
+    worker._cond_cache = {}
+    return worker
+
+
+def test_conditioning_casts_latents_to_half_under_fp16():
+    # The float32 front-end produces float32 latents; they must reach the half
+    # GPT / vocoder as half, or inference crashes with the same dtype error.
+    model = types.SimpleNamespace(
+        get_conditioning_latents=lambda audio_path: (_FakeLatent(), _FakeLatent())
+    )
+    worker = _worker_stub(model, fp16=True)
+
+    gpt_latent, speaker_emb = worker._conditioning("voice.wav")
+
+    assert gpt_latent.dtype == "float16"
+    assert speaker_emb.dtype == "float16"
+    # Cached in the cast form (the cast must not run twice / be lost).
+    assert worker._cond_cache["voice.wav"] == (gpt_latent, speaker_emb)
+    assert worker._conditioning("voice.wav") == (gpt_latent, speaker_emb)
+
+
+def test_conditioning_leaves_latents_untouched_without_fp16():
+    model = types.SimpleNamespace(
+        get_conditioning_latents=lambda audio_path: (_FakeLatent(), _FakeLatent())
+    )
+    worker = _worker_stub(model, fp16=False)
+
+    gpt_latent, speaker_emb = worker._conditioning("voice.wav")
+
+    assert gpt_latent.dtype == "float32"
+    assert speaker_emb.dtype == "float32"
+
+
 def test_download_model_uses_resolver(tmp_path, monkeypatch):
     cfg = Config(models_dir=str(tmp_path / "models"))
     seen = []
