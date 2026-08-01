@@ -21,3 +21,6 @@ orphan.err
 # Voice samples are provided by the host at runtime; keep the dir, ignore contents.
 samples/*
 !samples/.gitkeep
+
+# Build artifact produced by the host packaging step, never versioned.
+EchokrauTTS.zip
