@@ -82,6 +82,48 @@ def _module_by_path(model, path: str):
     return obj
 
 
+class _HalfOutput:
+    """Wraps a plain-callable "embedding" so its output follows the model dtype.
+
+    Needed for the GPT2 position embeddings: coqui replaces ``gpt.wpe`` with
+    ``functools.partial(null_position_embeddings, …)``, which returns
+    ``torch.zeros(...)`` with **no dtype** — always float32, and being a plain
+    callable rather than an ``nn.Module`` it is invisible to ``model.half()``.
+    Adding it to the half embeddings promotes the whole hidden state back to
+    float32, so every LayerNorm in the stack then fails with
+    ``expected scalar type Float but found Half``.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __call__(self, *args, **kwargs):
+        out = self.inner(*args, **kwargs)
+        return out.half() if hasattr(out, "half") else out
+
+
+# Attributes that look like embeddings but are plain callables (see _HalfOutput).
+FP16_CALLABLE_EMBEDDINGS = (("gpt.gpt", "wpe"),)
+
+
+def _patch_callable_embeddings(model) -> list[str]:
+    """Make non-Module embedding callables emit half. Returns patched paths.
+
+    Skips anything that *is* an ``nn.Module`` (detected via ``parameters``, so
+    this stays importable without torch) — those are already covered by
+    ``model.half()`` and must not be replaced, or they'd be unregistered.
+    """
+    patched: list[str] = []
+    for path, attr in FP16_CALLABLE_EMBEDDINGS:
+        owner = _module_by_path(model, path)
+        inner = getattr(owner, attr, None)
+        if owner is None or inner is None or hasattr(inner, "parameters"):
+            continue
+        setattr(owner, attr, _HalfOutput(inner))
+        patched.append(f"{path}.{attr}")
+    return patched
+
+
 def _apply_fp16(model) -> list[str]:
     """Half-precision the model, keeping the reference-audio front-end float32.
 
@@ -90,6 +132,7 @@ def _apply_fp16(model) -> list[str]:
     degrades to "may crash again" rather than "crashes at load".
     """
     model.half()
+    _patch_callable_embeddings(model)
     kept: list[str] = []
     for path in FP16_FLOAT32_MODULES:
         module = _module_by_path(model, path)

@@ -45,12 +45,22 @@ class _FakeModule:
 
 
 class _FakeXtts(_FakeModule):
-    def __init__(self, perceiver=True):
+    def __init__(self, perceiver=True, wpe="callable"):
         super().__init__()
         self.hifigan_decoder = types.SimpleNamespace(speaker_encoder=_FakeModule())
         gpt = types.SimpleNamespace(conditioning_encoder=_FakeModule())
         if perceiver:
             gpt.conditioning_perceiver = _FakeModule()
+        # gpt.gpt is the GPT2 transformer; its position embedding is either a
+        # plain callable (coqui's null_position_embeddings partial) or a Module.
+        inner = types.SimpleNamespace()
+        if wpe == "callable":
+            inner.wpe = lambda *a, **kw: _FakeLatent()
+        elif wpe == "module":
+            module = _FakeModule()
+            module.parameters = lambda: iter(())
+            inner.wpe = module
+        gpt.gpt = inner
         self.gpt = gpt
 
 
@@ -71,6 +81,38 @@ def test_apply_fp16_keeps_reference_audio_frontend_in_float32():
     assert model.hifigan_decoder.speaker_encoder.calls == ["float"]
     assert model.gpt.conditioning_encoder.calls == ["float"]
     assert model.gpt.conditioning_perceiver.calls == ["float"]
+
+
+def test_apply_fp16_casts_the_plain_callable_position_embedding():
+    # Regression: coqui replaces gpt.gpt.wpe with a partial returning
+    # torch.zeros(...) — no dtype, so always float32, and invisible to
+    # model.half() because it is not an nn.Module. Adding it to the half
+    # embeddings promoted the hidden state back to float32 and every LayerNorm
+    # died with "expected scalar type Float but found Half".
+    model = _FakeXtts()
+
+    xtts_backend._apply_fp16(model)
+
+    assert isinstance(model.gpt.gpt.wpe, xtts_backend._HalfOutput)
+    assert model.gpt.gpt.wpe().dtype == "float16"
+
+
+def test_patch_callable_embeddings_leaves_real_modules_alone():
+    # An nn.Module position embedding is already covered by model.half(), and
+    # replacing it would unregister it from the module tree.
+    model = _FakeXtts(wpe="module")
+    original = model.gpt.gpt.wpe
+
+    patched = xtts_backend._patch_callable_embeddings(model)
+
+    assert patched == []
+    assert model.gpt.gpt.wpe is original
+
+
+def test_patch_callable_embeddings_skips_missing_attribute():
+    model = _FakeXtts(wpe=None)
+
+    assert xtts_backend._patch_callable_embeddings(model) == []
 
 
 def test_apply_fp16_skips_missing_submodules():
