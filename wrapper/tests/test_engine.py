@@ -1,3 +1,5 @@
+import re
+
 import numpy as np
 import pytest
 
@@ -100,6 +102,59 @@ async def test_stream_emits_request_timing_logs(config, monkeypatch):
     assert "generated=" in done and "audio=" in done and "rtf=" in done
     # Two sentences × 50 ms of fake silence → ~0.10 s of audio reported.
     assert "audio=0.10s" in done
+    # One-shot path: one PCM part per sentence, and the first-audio timestamp is
+    # present (it is a wall-clock measurement, so only its shape is asserted).
+    assert "parts=2" in done
+    assert re.search(r"first=\d+\.\d\ds", done)
+
+
+@pytest.mark.asyncio
+async def test_timing_log_reports_first_audio_and_parts_when_streaming(config, monkeypatch):
+    # The streaming metric: a token-streaming worker delivers many parts, so
+    # `parts` >> chunks. Together with `first` this makes it observable that
+    # audio left the engine before the request finished — i.e. a consumer that
+    # only starts playing at the end is buffering on its own side.
+    from src import engine as engine_mod
+
+    logs: list[str] = []
+    monkeypatch.setattr(engine_mod.ndjson, "log", lambda msg, level="info": logs.append(msg))
+
+    config.max_chars_per_chunk = 5  # force "Eins." / "Zwei." into 2 chunks
+    engine = make_engine(config, streaming=True)
+    await engine.start()
+    job = engine._jobs.create()
+    params = TtsParams(sample="anna_de.wav", text="Eins. Zwei.")
+    path = engine.samples.resolve_path("anna_de.wav")
+    engine.admit()
+
+    _ = [c async for c in engine.stream(job, params, path)]
+
+    done = next(m for m in logs if m.startswith("tts request done:"))
+    # 2 chunks × FakeStreamWorker.PARTS_PER_CHUNK parts.
+    assert "parts=6" in done
+    assert re.search(r"first=\d+\.\d\ds", done)
+
+
+@pytest.mark.asyncio
+async def test_timing_log_reports_no_first_audio_for_empty_text(config, monkeypatch):
+    # Empty text chunks to nothing → no PCM ever yielded. `first` must say so
+    # rather than claiming a bogus 0.00s.
+    from src import engine as engine_mod
+
+    logs: list[str] = []
+    monkeypatch.setattr(engine_mod.ndjson, "log", lambda msg, level="info": logs.append(msg))
+
+    engine = make_engine(config)
+    await engine.start()
+    job = engine._jobs.create()
+    params = TtsParams(sample="anna_de.wav", text="   ")
+    path = engine.samples.resolve_path("anna_de.wav")
+    engine.admit()
+
+    _ = [c async for c in engine.stream(job, params, path)]
+
+    done = next(m for m in logs if m.startswith("tts request done:"))
+    assert "first=n/a" in done and "parts=0" in done
 
 
 @pytest.mark.asyncio

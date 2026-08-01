@@ -317,6 +317,13 @@ class Engine:
         # the end of a completed request.
         started = time.monotonic()
         total_bytes = 0
+        # Time of the FIRST yielded PCM and the number of parts emitted. This is
+        # the streaming metric: with token streaming (XTTS) audio starts flowing
+        # long before the request finishes, so a `first` far below `generated`
+        # proves the wrapper streams — and pins a late playback on the consumer
+        # instead. Without it the only observable is the end of the request.
+        first_audio: Optional[float] = None
+        parts = 0
 
         worker: Optional[WorkerProtocol] = None
         try:
@@ -328,21 +335,24 @@ class Engine:
                 if job.cancelled:
                     self._jobs.finish(job, CANCELLED)
                     return
+                # Token streaming (XTTS) emits PCM parts as they are produced;
+                # one-shot (F5) emits a single part per sentence. Both are
+                # consumed as one async iterator so cancel checks and the byte /
+                # part / first-audio bookkeeping exist exactly once.
+                source = (
+                    self._stream_chunk(worker, audio_path, ref_text, chunk, params)
+                    if streaming
+                    else self._one_shot_chunk(worker, audio_path, ref_text, chunk, params)
+                )
                 try:
-                    if streaming:
-                        # Token streaming (XTTS): emit PCM parts as they are
-                        # produced, checking cancel between parts so a cancelled
-                        # long sentence stops mid-flight.
-                        async for pcm in self._stream_chunk(worker, audio_path, ref_text, chunk, params):
-                            if job.cancelled:
-                                self._jobs.finish(job, CANCELLED)
-                                return
-                            total_bytes += len(pcm)
-                            yield pcm
-                    else:
-                        # One-shot (F5): whole sentence synthesized, then emitted.
-                        pcm = await self._infer_chunk(worker, audio_path, ref_text, chunk, params)
+                    async for pcm in source:
+                        if job.cancelled:
+                            self._jobs.finish(job, CANCELLED)
+                            return
+                        if first_audio is None:
+                            first_audio = time.monotonic() - started
                         total_bytes += len(pcm)
+                        parts += 1
                         yield pcm
                 except InferenceError as exc:
                     # Surface the *real* cause on stdout — otherwise the only
@@ -358,28 +368,41 @@ class Engine:
                 self._jobs.advance(job)
 
             self._jobs.finish(job, DONE)
-            self._log_timing(job, worker, started, total_bytes)
+            self._log_timing(job, worker, started, total_bytes, first_audio, parts)
         finally:
             if worker is not None:
                 self._free.put_nowait(worker)
             self._pending -= 1
 
     def _log_timing(
-        self, job: Job, worker: WorkerProtocol, started: float, total_bytes: int
+        self,
+        job: Job,
+        worker: WorkerProtocol,
+        started: float,
+        total_bytes: int,
+        first_audio: Optional[float],
+        parts: int,
     ) -> None:
         """Emit a one-line efficiency summary for a completed request (SPEC §8.1).
 
         Reports how long generation took, how much audio was produced, and the
         real-time factor (generation ÷ audio; < 1.0 means faster than real time)
         so the user can gauge how efficiently the engine runs. PCM is 16-bit mono,
-        so 2 bytes per sample."""
+        so 2 bytes per sample.
+
+        ``first`` (seconds until the first PCM left the engine) and ``parts``
+        (how many pieces the response was delivered in) make the *streaming*
+        behaviour observable: ``first`` ≪ ``generated`` with ``parts`` > 1 means
+        audio flowed while synthesis was still running, so a consumer that only
+        starts playing at the end is buffering on its own side."""
         gen_s = time.monotonic() - started
         sr = getattr(worker, "sample_rate", 0) or DEFAULT_SAMPLE_RATE
         audio_s = (total_bytes / 2) / sr if sr else 0.0
         rtf = gen_s / audio_s if audio_s > 0 else 0.0
+        first_s = f"{first_audio:.2f}s" if first_audio is not None else "n/a"
         ndjson.log(
             f"tts request done: job={job.job_id} generated={gen_s:.2f}s "
-            f"audio={audio_s:.2f}s rtf={rtf:.2f}"
+            f"audio={audio_s:.2f}s rtf={rtf:.2f} first={first_s} parts={parts}"
         )
 
     async def _infer_chunk(
@@ -407,6 +430,18 @@ class Engine:
             # ``RuntimeError()``) stringify to empty, leaving no clue what failed.
             raise InferenceError(f"{type(exc).__name__}: {exc}") from exc
         return float_to_pcm16(wav)
+
+    async def _one_shot_chunk(
+        self,
+        worker: WorkerProtocol,
+        audio_path: Path,
+        ref_text: Optional[str],
+        chunk: str,
+        params: TtsParams,
+    ) -> AsyncIterator[bytes]:
+        """Adapt the one-shot path (F5) to the same async-iterator shape as
+        :meth:`_stream_chunk`, so :meth:`stream` has a single consume loop."""
+        yield await self._infer_chunk(worker, audio_path, ref_text, chunk, params)
 
     async def _stream_chunk(
         self,

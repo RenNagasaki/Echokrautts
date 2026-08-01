@@ -440,6 +440,46 @@ def step_model(config) -> None:
     ndjson.progress(index, TOTAL_STEPS, step, "Sprachmodelle geladen", percent=100, done=True)
 
 
+def _env_value(value) -> str:
+    """Serialize one resolved config value into its ``F5W_*`` string form.
+
+    The inverse of ``config._coerce``: bools as true/false, lists comma-joined,
+    dicts as JSON, ``None`` as the empty string (which _coerce maps back to None
+    for the nullable fields).
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, dict):
+        return json.dumps(value)
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(v) for v in value)
+    return str(value)
+
+
+def _config_env(config) -> dict:
+    """Every resolved config field as an ``F5W_*`` variable.
+
+    The server runs as a *subprocess* that re-runs ``load_config`` from scratch,
+    so anything the host passed to bootstrap.py on the command line is invisible
+    to it unless forwarded. This used to be a hand-written list of a few fields,
+    which silently dropped every other flag: ``--xtts-fp16 true`` reached the
+    bootstrap but not the server, which then read ``xtts_fp16: false`` from
+    config.json and ran without fp16 while ``/health`` honestly reported it off.
+    Forwarding the whole resolved config removes the class of bug — the server
+    can no longer disagree with the config the bootstrap resolved.
+    """
+    from dataclasses import fields as _fields
+
+    from src.config import ENV_PREFIX
+
+    return {
+        ENV_PREFIX + f.name.upper(): _env_value(getattr(config, f.name))
+        for f in _fields(config)
+    }
+
+
 def _server_env(config) -> dict:
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
@@ -450,17 +490,14 @@ def _server_env(config) -> dict:
     env["HF_HUB_CACHE"] = str(config.models_path)
     if config.hf_endpoint:
         env["HF_ENDPOINT"] = config.hf_endpoint
+    # Propagate the resolved config so the server subprocess honors every flag
+    # the host passed to bootstrap.py, not just config.json defaults.
+    env.update(_config_env(config))
     # The server watches this pid and self-exits when it dies, so it can never be
     # orphaned (closed console window, killed bootstrap, etc.). An explicit
     # --parent-pid (e.g. the C# host) wins; otherwise watch bootstrap itself.
+    # Set AFTER the bulk forwarding, which would otherwise write a bare "".
     env["F5W_PARENT_PID"] = str(config.parent_pid or os.getpid())
-    # Propagate resolved overrides so the server subprocess (which re-runs
-    # load_config) honors flags the host passed to bootstrap.py, e.g.
-    # --language / --api-key, not just config.json defaults.
-    env["F5W_LANGUAGE"] = config.language
-    env["F5W_TTS_BACKEND"] = config.tts_backend
-    if config.api_key:
-        env["F5W_API_KEY"] = config.api_key
     # Both engines are installed; the XTTS env is harmless for the F5 backend.
     # Accept the CPML non-interactively and keep XTTS weights under models/.
     env["COQUI_TOS_AGREED"] = "1"
