@@ -68,7 +68,9 @@ def _resolve_custom_model_dir(config: Config) -> str | None:
     if (d / "config.json").is_file() and (
         (d / "model.pth").is_file() or (d / "model.safetensors").is_file()
     ):
-        ndjson.log(f"Nutze eigenes XTTS-Modell: {d}")
+        # log_once: the resolver runs once per worker (pool of n) — a plain log
+        # would print the same line n times.
+        ndjson.log_once(f"Nutze eigenes XTTS-Modell: {d}")
         return str(d)
     return None
 
@@ -129,7 +131,7 @@ class XTTSWorker:
         self._fp16 = _should_use_fp16(config, resolved_device)
         if self._fp16:
             model.half()
-            ndjson.log(f"XTTS fp16 enabled on {resolved_device}")
+            ndjson.log_once(f"XTTS fp16 enabled on {resolved_device}")
         self._model = model
 
         sr = getattr(getattr(xtts_config, "audio", None), "output_sample_rate", None)

@@ -22,6 +22,9 @@ from typing import Any, Optional
 # never interleave half-written JSON lines on stdout.
 _lock = threading.Lock()
 
+# Messages already emitted via ``log_once`` (guarded by ``_lock``).
+_seen_once: set[tuple[str, str]] = set()
+
 
 def _write(obj: dict[str, Any]) -> None:
     # Stamp every event with a UTC ISO-8601 timestamp (millisecond precision) so
@@ -99,6 +102,27 @@ def ready(host: str, port: int, backend: str, device: str, workers: int) -> None
 def log(message: str, level: str = "info") -> None:
     """Informational log line surfaced to the host UI."""
     _write({"event": "log", "level": level, "message": message})
+
+
+def log_once(message: str, level: str = "info") -> None:
+    """Like :func:`log`, but emits each distinct message only once per process.
+
+    For lines that state a *fact about this process* ("using the custom model",
+    "fp16 enabled") rather than an event. Those live in code that runs once per
+    worker (the pool builds ``max_workers_hint`` workers, each loading the model),
+    so a plain ``log`` would repeat the same line n times and read like a bug.
+    """
+    with _lock:
+        if (level, message) in _seen_once:
+            return
+        _seen_once.add((level, message))
+    log(message, level=level)
+
+
+def reset_log_once() -> None:
+    """Forget what :func:`log_once` has already emitted (tests only)."""
+    with _lock:
+        _seen_once.clear()
 
 
 def error(message: str, fatal: bool = False) -> None:

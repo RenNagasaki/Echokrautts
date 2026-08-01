@@ -72,7 +72,8 @@ def resolve_custom_model(config: Config) -> Optional[ResolvedModel]:
     vocab = d / "vocab.txt"
     arch_file = d / "arch.txt"
     arch = arch_file.read_text(encoding="utf-8").strip() if arch_file.is_file() else ""
-    ndjson.log(f"Nutze eigenes F5-Modell: {Path(ckpt).name}")
+    # log_once: same resolver runs per worker (pool of n) — see ndjson.log_once.
+    ndjson.log_once(f"Nutze eigenes F5-Modell: {Path(ckpt).name}")
     return ResolvedModel(
         arch=arch or "F5TTS_Base",
         ckpt_file=ckpt,
