@@ -136,6 +136,14 @@ class Config:
     )
     samples_dir: str = "samples"
     models_dir: str = "models"
+    # First-start convenience: with an empty samples folder every /tts is a 404,
+    # and that is the state of every fresh install and every fresh container
+    # volume. The newest voice pack is then fetched from the Echokraut releases.
+    # Identified by TAG PREFIX, not by GitHub's "latest release" — that repo also
+    # publishes plugin releases (see voicepack.py).
+    voicepack_auto_download: bool = True
+    voicepack_repo: str = "RenNagasaki/Echokraut"
+    voicepack_tag_prefix: str = "EK-VoicePack-"
     max_workers: Optional[int] = None
     vram_reserve_gb: float = 1.5
     per_job_gb: float = 3.0
@@ -205,7 +213,7 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
         return int(raw)
     if name in ("vram_reserve_gb", "per_job_gb"):
         return float(raw)
-    if name in ("asr_for_missing_ref_text", "xtts_fp16"):
+    if name in ("asr_for_missing_ref_text", "xtts_fp16", "voicepack_auto_download"):
         low = raw.lower()
         if low in _BOOL_TRUE:
             return True

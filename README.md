@@ -96,7 +96,7 @@ Pin a version with `ECHOKRAUTTS_TAG=0.0.0.6 docker compose up -d`.
 
 | Container path | What belongs there | If you skip it |
 | --- | --- | --- |
-| `/data/samples` | Your voice samples. Either `<name>.wav` (also `.flac`/`.mp3`) or a folder `<name>/` holding several clips of the same voice — one is picked at random per request. The request only uses the **stem**, so `X`, `X.wav` and `X.mp3` all resolve to the same voice. | `/tts` answers 404 `SampleNotFound` for every request — the container has no voices of its own. |
+| `/data/samples` | Your voice samples. Either `<name>.wav` (also `.flac`/`.mp3`) or a folder `<name>/` holding several clips of the same voice — one is picked at random per request. The request only uses the **stem**, so `X`, `X.wav` and `X.mp3` all resolve to the same voice. Empty on first start → the container fetches the [Echokraut voice pack](#voice-samples) into it. | The voice pack is re-downloaded on every `docker run` and lost with the container. |
 | `/data/models` | Model weights plus the HuggingFace and Coqui caches. Deliberately **not** baked into the image: the weights are non-commercially licensed (F5 finetunes CC-BY-NC-4.0, XTTS-v2 CPML), so the container fetches them on first start. | Works, but every `docker run` re-downloads several GB into the container's throwaway layer. |
 
 **Port.** The server listens on `8765` inside the container (`EXPOSE 8765`); publish it with
@@ -113,6 +113,7 @@ no separate Docker configuration schema. The ones that actually matter in a cont
 | `F5W_XTTS_FP16` | unset (`false`) | XTTS half precision, ~1.4× faster. CUDA only — silently ignored on CPU. |
 | `F5W_API_KEY` | unset | Requires `Authorization: Bearer <key>` on every endpoint. **Set it if the port is reachable from anywhere but the host** — the server binds `0.0.0.0`. |
 | `F5W_MAX_WORKERS` | unset (cap 4) | **Upper cap**, not a fixed count: the pool size is derived from free VRAM at startup (`(free − F5W_VRAM_RESERVE_GB) ÷ F5W_PER_JOB_GB`) and then capped by this. Set `1` to force a single worker — sensible on CPU or a small GPU. |
+| `F5W_VOICEPACK_AUTO_DOWNLOAD` | `true` | Fetch the Echokraut voice pack when the samples volume is empty. Set `false` if you only ever use your own voices. |
 | `F5W_GPU_BACKEND` | `auto` (cuda image) · `cpu` · `rocm` | Forces the hardware backend instead of probing. Each image ships the right value; override only to deliberately fall back (`cpu`). Values: `auto`, `cuda`, `rocm`, `dml`, `xpu`, `cpu`. |
 | `F5W_SAMPLES_DIR` / `F5W_MODELS_DIR` | `/data/samples` · `/data/models` | Only change these if you mount somewhere else — the defaults match the volumes above. |
 | `F5W_PORT` / `F5W_HOST` | `8765` · `0.0.0.0` | Bind address inside the container. |
@@ -304,7 +305,18 @@ with no config edit; this also exposes it on your LAN, so set an `api_key` (then
 
 ## Voice samples
 
-Drop `*.wav`/`*.flac`/`*.mp3` files into `wrapper/samples/`. A voice can be either:
+**You start with voices.** On first start — an empty `samples` folder, which is also every fresh
+container volume — the wrapper downloads the current **Echokraut voice pack** and unpacks it there
+(~107 MB, 260 voices with reference transcripts). It is skipped as soon as the folder holds any
+audio, and it never blocks startup: no network just means no voices yet, which you fix by dropping in
+a file. Turn it off with `voicepack_auto_download: false` (`F5W_VOICEPACK_AUTO_DOWNLOAD=false`).
+
+The pack is found by **release tag prefix** (`voicepack_tag_prefix`, default `EK-VoicePack-`) in
+`voicepack_repo`, not by GitHub's "latest release" — that repository also publishes plugin releases,
+and its newest release is usually one of those. Versions are compared numerically per segment, so
+`1.10.0` correctly outranks `1.9.0`.
+
+Drop `*.wav`/`*.flac`/`*.mp3` files into `wrapper/samples/` to add your own. A voice can be either:
 
 * a **single audio file** — `samples/Alphinaud.wav`, or
 * a **voice folder** — `samples/Alphinaud/` holding several clips of the *same* voice. One clip is

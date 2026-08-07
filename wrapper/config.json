@@ -31,6 +31,9 @@
     ]
   },
   "samples_dir": "samples",
+  "voicepack_auto_download": true,
+  "voicepack_repo": "RenNagasaki/Echokraut",
+  "voicepack_tag_prefix": "EK-VoicePack-",
   "models_dir": "models",
   "max_workers": null,
   "vram_reserve_gb": 1.5,

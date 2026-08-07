@@ -33,6 +33,12 @@ download_models() {
         *)    log "ensuring F5-TTS weights in ${F5W_MODELS_DIR:-models} …"
               python -m src.models ;;
     esac
+    # Voices. The samples volume starts out empty on every fresh deployment, and
+    # without a single voice every /tts is a 404 — so the current voice pack is
+    # fetched on first start. Skipped as soon as the volume holds audio, and
+    # never fatal (set F5W_VOICEPACK_AUTO_DOWNLOAD=false to turn it off).
+    log "ensuring voice samples in ${F5W_SAMPLES_DIR:-samples} …"
+    python -m src.voicepack || log "voice pack download failed — continuing"
 }
 
 case "${1:-serve}" in

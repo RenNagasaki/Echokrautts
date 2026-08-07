@@ -461,6 +461,13 @@ def step_model(config) -> None:
     rc = _popen_forward([str(_venv_python()), "-m", "src.xtts_backend"], env)
     if rc != 0:
         raise FatalError("XTTS-Modell-Download fehlgeschlagen (siehe stderr/Log)")
+    # Voices, not weights — and deliberately NOT fatal: a failed voice pack means
+    # "no voices yet", which the user can fix by dropping in a wav. It must never
+    # keep an otherwise working install from starting, so a non-zero exit only
+    # gets logged. The module itself skips the download when samples exist.
+    ndjson.progress(index, TOTAL_STEPS, step, "Prüfe Sprachproben …", percent=90)
+    if _popen_forward([str(_venv_python()), "-m", "src.voicepack"], env) != 0:
+        ndjson.log("Voice-Pack-Download fehlgeschlagen — Installation läuft weiter", level="warning")
     _mark_done(step)
     ndjson.progress(index, TOTAL_STEPS, step, "Sprachmodelle geladen", percent=100, done=True)
 
