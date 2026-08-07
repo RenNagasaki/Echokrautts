@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings. A CRLF shebang makes the container
+# entrypoint fail with "no such file or directory" — and this repo is edited on
+# Windows with core.autocrlf=true.
+*.sh text eol=lf
+Dockerfile text eol=lf

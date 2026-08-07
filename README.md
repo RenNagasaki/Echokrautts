@@ -48,7 +48,143 @@ libraries — an external, non-self-contained dependency. On 2.7.x, `torchaudio.
 bundled-libsndfile **soundfile** backend, so the wrapper installs and runs with **no external
 binaries**. The TTS engines declare `torchcodec` as a dependency but never import it (they only call
 `torchaudio.load`), so the bootstrap re-pins torch after the deps install and drops the unused
-torchcodec. Bump the pins deliberately and re-verify the soundfile path if you change them.
+torchcodec. Bump the pins deliberately and re-verify the soundfile path if you change them. The
+container image applies the same pin and the same re-pin/uninstall, verified at build time.
+
+## Docker
+
+The container is the same wrapper, minus the bootstrap: `uv`, the Python pin, GPU detection and the
+dependency install all happened at **build** time. What is left at runtime is downloading the model
+weights into the volume and serving. **Both engines are in every image** — which one runs is one
+environment variable, so switching engine or language is a restart, never a reinstall.
+
+### Images
+
+| Tag | Variant | Requires on the host |
+| --- | --- | --- |
+| `ghcr.io/rennagasaki/echokrautts:latest` · `:<version>` | CUDA (cu128) | NVIDIA driver + [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) |
+| `ghcr.io/rennagasaki/echokrautts:latest-cpu` · `:<version>-cpu` | CPU | nothing — but synthesis is far slower than real time |
+| `:main` · `:main-cpu` · `:sha-<commit>` | either | untagged builds from a branch, published on demand |
+
+There is no `nvidia/cuda` base image: the cu128 torch wheels bring their own CUDA runtime, exactly
+like the bare-metal install, and the driver is injected by the container toolkit.
+
+### Getting it running
+
+```bash
+curl -O https://raw.githubusercontent.com/RenNagasaki/Echokrautts/main/docker-compose.yml
+mkdir -p samples models          # bind-mount targets, see below
+docker compose up -d             # CPU host: -f docker-compose.cpu.yml
+docker compose logs -f           # first start downloads the weights (2-5 GB)
+curl localhost:8765/health
+```
+
+Pin a version with `ECHOKRAUTTS_TAG=0.0.0.6 docker compose up -d`.
+
+### What you have to set
+
+**Volumes — two, and both matter.** Everything else in the image is read-only.
+
+| Container path | What belongs there | If you skip it |
+| --- | --- | --- |
+| `/data/samples` | Your voice samples. Either `<name>.wav` (also `.flac`/`.mp3`) or a folder `<name>/` holding several clips of the same voice — one is picked at random per request. The request only uses the **stem**, so `X`, `X.wav` and `X.mp3` all resolve to the same voice. | `/tts` answers 404 `SampleNotFound` for every request — the container has no voices of its own. |
+| `/data/models` | Model weights plus the HuggingFace and Coqui caches. Deliberately **not** baked into the image: the weights are non-commercially licensed (F5 finetunes CC-BY-NC-4.0, XTTS-v2 CPML), so the container fetches them on first start. | Works, but every `docker run` re-downloads several GB into the container's throwaway layer. |
+
+**Port.** The server listens on `8765` inside the container (`EXPOSE 8765`); publish it with
+`-p 8765:8765` or the compose `ports:` entry. Change the *inside* port with `F5W_PORT` only if you
+have a reason to — publishing a different host port is the usual way.
+
+**Environment.** Every `F5W_*` variable is a field of `wrapper/config.json`, upper-cased — there is
+no separate Docker configuration schema. The ones that actually matter in a container:
+
+| Variable | Image default | Meaning |
+| --- | --- | --- |
+| `F5W_TTS_BACKEND` | `xtts` | `xtts` = XTTS-v2, clones from the sample alone, multilingual per request. `f5` = F5-TTS, loads **one** language finetune per process and needs a transcript (or ASR) for the reference clip. |
+| `F5W_LANGUAGE` | `de` | F5: which finetune is loaded at startup. XTTS: the fallback when a request omits `language`. |
+| `F5W_XTTS_FP16` | unset (`false`) | XTTS half precision, ~1.4× faster. CUDA only — silently ignored on CPU. |
+| `F5W_API_KEY` | unset | Requires `Authorization: Bearer <key>` on every endpoint. **Set it if the port is reachable from anywhere but the host** — the server binds `0.0.0.0`. |
+| `F5W_MAX_WORKERS` | unset (cap 4) | **Upper cap**, not a fixed count: the pool size is derived from free VRAM at startup (`(free − F5W_VRAM_RESERVE_GB) ÷ F5W_PER_JOB_GB`) and then capped by this. Set `1` to force a single worker — sensible on CPU or a small GPU. |
+| `F5W_SAMPLES_DIR` / `F5W_MODELS_DIR` | `/data/samples` · `/data/models` | Only change these if you mount somewhere else — the defaults match the volumes above. |
+| `F5W_PORT` / `F5W_HOST` | `8765` · `0.0.0.0` | Bind address inside the container. |
+| `F5W_STREAM_CHUNK_SIZE` | `20` | XTTS token-streaming granularity; lower = earlier first audio, slightly more overhead. F5 ignores it. |
+| `F5W_MAX_CHARS_PER_CHUNK` | `250` | Sentence-chunking limit for long texts. |
+
+Two container-only variables exist next to those: `ECHOKRAUTTS_SKIP_DOWNLOAD=1` skips the weight
+download at start, and `UVICORN_LOG_LEVEL` (default `warning`) sets uvicorn's own verbosity — the
+wrapper's NDJSON log on stdout is unaffected by either.
+
+Type coercion follows the config schema: bools accept `true/false/1/0/yes/no/on/off`, `F5W_API_KEY=""`
+means unset, `F5W_ALLOWED_SAMPLE_EXT` is comma-separated, `F5W_LANGUAGES` is JSON.
+`F5W_PARENT_PID` is for the desktop host's watchdog and must stay unset in a container — otherwise
+the server shuts itself down as soon as that PID is not alive.
+
+**Do not pass `--gpus` to the `-cpu` image.** Hardware detection still runs inside the container and
+keys off `nvidia-smi`, which the container toolkit injects — the wrapper would then select a CUDA
+device that the CPU-only torch build cannot serve. GPU image + `--gpus all`, or CPU image + no
+`--gpus`; nothing in between.
+
+**`/health` is the source of truth**: it reports the backend, language and effective fp16 the
+process actually came up with, not what you *meant* to set.
+
+```bash
+docker compose up -d                                       # xtts, per compose file
+F5W_TTS_BACKEND=f5 F5W_LANGUAGE=de docker compose up -d    # F5, German
+curl -s localhost:8765/health
+```
+
+### Without compose
+
+```bash
+# --gpus all belongs to the CUDA image only; drop it entirely for :latest-cpu.
+docker run -d --name echokrautts \
+  --gpus all \
+  -p 8765:8765 \
+  -v "$PWD/samples:/data/samples" \
+  -v "$PWD/models:/data/models" \
+  -e F5W_TTS_BACKEND=xtts \
+  -e F5W_LANGUAGE=de \
+  -e F5W_XTTS_FP16=true \
+  ghcr.io/rennagasaki/echokrautts:latest
+```
+
+Then synthesize (raw PCM, s16 mono 24 kHz — bytes ÷ 2 ÷ 24000 = seconds):
+
+```bash
+curl -X POST localhost:8765/tts -H 'Content-Type: application/json' \
+  -d '{"sample":"my_voice","text":"Hallo Welt."}' --output out.pcm
+```
+
+### Operating it
+
+```bash
+docker compose run --rm echokrautts download   # pre-fill the model volume, don't serve
+docker compose run --rm echokrautts bash       # shell in the image, no download
+docker compose pull && docker compose up -d    # update — the volumes survive
+```
+
+The entrypoint only downloads the **active** backend's weights (F5 pulls all four language
+finetunes, XTTS one multilingual model). Switch backend later and the next start fetches what is
+missing; nothing is re-downloaded twice. `ECHOKRAUTTS_SKIP_DOWNLOAD=1` suppresses the step entirely,
+e.g. when the volume was filled by hand.
+
+A **custom model** works the same as on bare metal: drop it into `models/echokraut_custom/` on the
+host (an F5 checkpoint, or an XTTS directory with `config.json` + `model.pth`) and it overrides the
+configured model of the active engine — auto-detected, no variable to set.
+
+The `HEALTHCHECK` has a 45-minute start period because of that first download; a container reported
+as `starting` for a long time is normal on first run and `docker compose logs -f` shows the progress.
+
+### Building the image yourself
+
+Two GitHub workflows, both publishing to GHCR:
+
+- **Docker build (manual)** — Actions → Run workflow. Pick a branch, `variant` (cuda/cpu/both) and a
+  `tag` (default `main`). Pushes `<tag>`, `<tag>-cpu` and `sha-<commit>`; never touches `latest`.
+- **Docker release** — runs when a GitHub release is published, pushing `<version>` and `latest`
+  (plus the `-cpu` pair). Pre-releases skip the `latest` tags.
+
+Locally: `docker build -t echokrautts:dev .` for CUDA, or add
+`--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu` for the CPU variant.
 
 ## Hardware / GPU acceleration
 

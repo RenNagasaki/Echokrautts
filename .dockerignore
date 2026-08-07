@@ -1,0 +1,30 @@
+# Keep the build context small: only wrapper/src, wrapper/pyproject.toml,
+# wrapper/config.json and docker/ are actually COPYed.
+.git
+.gitlab-ci.yml
+.github
+.claude
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+
+# Local install state — must never leak into an image (a host venv with
+# Windows paths, multi-GB weights, private voice samples).
+wrapper/.venv
+wrapper/.venv-test
+wrapper/.uv
+wrapper/.state
+wrapper/models
+wrapper/samples
+wrapper/tests
+wrapper/conftest.py
+wrapper/*.zip
+
+# Docs and one-click starters are for the bare-metal install, not the image.
+README.md
+CLAUDE.md
+THIRD_PARTY_LICENSES.md
+licenses
+start-*.bat
+start-*.sh
+docker-compose*.yml

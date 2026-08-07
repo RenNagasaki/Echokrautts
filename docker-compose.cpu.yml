@@ -1,0 +1,29 @@
+# ============================================================================
+#  Echokrautts — one-click deploy (CPU only).
+#
+#    docker compose -f docker-compose.cpu.yml up -d
+#
+#  Standalone file, not an override: the GPU compose file reserves an NVIDIA
+#  device, and a reservation cannot be cleanly removed by layering.
+#
+#  Expect synthesis to be far slower than real time (rtf >> 1). This variant is
+#  for hosts without an NVIDIA GPU, CI smoke tests, and API experiments.
+# ============================================================================
+services:
+  echokrautts:
+    image: ghcr.io/rennagasaki/echokrautts:${ECHOKRAUTTS_TAG:-latest}-cpu
+    container_name: echokrautts
+    restart: unless-stopped
+    ports:
+      - "${ECHOKRAUTTS_PORT:-8765}:8765"
+    environment:
+      F5W_TTS_BACKEND: "${F5W_TTS_BACKEND:-xtts}"
+      F5W_LANGUAGE: "${F5W_LANGUAGE:-de}"
+      # fp16 is CUDA-only; the wrapper ignores it on CPU (see /health).
+      F5W_XTTS_FP16: "false"
+      # One worker: CPU inference is memory-hungry and gains nothing from a pool.
+      F5W_MAX_WORKERS: "1"
+      # F5W_API_KEY: "change-me"
+    volumes:
+      - ./samples:/data/samples
+      - ./models:/data/models

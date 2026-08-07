@@ -1,0 +1,140 @@
+# ============================================================================
+#  Build and publish the Echokrautts container image to GHCR.
+#
+#  Trigger: a GitHub Release is PUBLISHED (or a manual run). Pushes to main do
+#  NOT build — the repo on GitHub is a mirror of GitLab, and every mirrored
+#  push would otherwise burn ~40 minutes of runner time on a multi-GB CUDA
+#  image nobody asked for.
+#
+#  Produces two variants from ONE Dockerfile:
+#    ghcr.io/rennagasaki/echokrautts:<version>        (CUDA / cu128)
+#    ghcr.io/rennagasaki/echokrautts:latest
+#    ghcr.io/rennagasaki/echokrautts:<version>-cpu
+#    ghcr.io/rennagasaki/echokrautts:latest-cpu
+#
+#  The `latest` tags are skipped for pre-releases.
+# ============================================================================
+name: Docker release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag for the image (e.g. 0.0.0.6)"
+        required: true
+        type: string
+      latest:
+        description: "Also push the :latest / :latest-cpu tags"
+        required: false
+        default: false
+        type: boolean
+
+# NOTE: no top-level IMAGE env — GHCR rejects upper-case paths and the owner is
+# "RenNagasaki". The name is lower-cased in the `meta` step below.
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cuda
+            suffix: ""
+            torch_index: https://download.pytorch.org/whl/cu128
+          - variant: cpu
+            suffix: "-cpu"
+            torch_index: https://download.pytorch.org/whl/cpu
+
+    steps:
+      - name: Free disk space
+        # The CUDA image is ~8 GB of layers; a stock ubuntu runner has barely
+        # enough free space with the preinstalled toolchains still in place.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and tags
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION="${{ github.event.release.tag_name }}"
+            LATEST="${{ github.event.release.prerelease && 'false' || 'true' }}"
+          else
+            VERSION="${{ inputs.version }}"
+            LATEST="${{ inputs.latest }}"
+          fi
+          # Tags in this repo are plain (0.0.0.5); tolerate a leading v anyway.
+          VERSION="${VERSION#v}"
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          IMAGE="ghcr.io/${OWNER}/echokrautts"
+          TAGS="${IMAGE}:${VERSION}${{ matrix.suffix }}"
+          if [ "$LATEST" = "true" ]; then
+            # $'\n' keeps the second tag flush-left; a folded YAML line would
+            # carry indentation into the tag itself.
+            TAGS="${TAGS}"$'\n'"${IMAGE}:latest${{ matrix.suffix }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${{ matrix.variant }} for version $VERSION (latest=$LATEST)"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # No extra secret needed: the job token can write packages of this repo.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            TORCH_INDEX_URL=${{ matrix.torch_index }}
+            ECHOKRAUTTS_VERSION=${{ steps.meta.outputs.version }}
+            VARIANT=${{ matrix.variant }}
+          provenance: false
+          # Cache per variant — the two share no layers past the base image
+          # because the torch install differs.
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+
+      - name: Smoke test (CPU variant only)
+        if: matrix.variant == 'cpu'
+        # Imports the app without downloading any weights: proves the venv is
+        # coherent (torch, f5-tts, coqui-tts, transformers pin) in the image
+        # that was just pushed. A real synthesis needs multi-GB weights and is
+        # out of scope for a runner.
+        run: |
+          docker run --rm -e ECHOKRAUTTS_SKIP_DOWNLOAD=1 \
+            "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-cpu" \
+            python -c "
+          import torch, importlib
+          from src.server import create_app
+          from src.config import load_config
+          importlib.import_module('TTS.utils.manage')
+          from transformers.pytorch_utils import isin_mps_friendly
+          cfg = load_config([])
+          assert create_app(cfg) is not None
+          print('smoke ok:', torch.__version__, cfg.tts_backend, cfg.models_dir, cfg.samples_dir)
+          "

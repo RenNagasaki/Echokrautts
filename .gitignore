@@ -1,0 +1,8 @@
+# Bind-mount targets created by docker-compose when deploying from a checkout.
+# (The install-state ignores for the bare-metal install live in wrapper/.gitignore.)
+/models/
+/samples/
+.env
+
+# Machine-local Claude Code state (worklog, verify script).
+.claude/

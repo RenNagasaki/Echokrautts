@@ -1,0 +1,47 @@
+# ============================================================================
+#  Echokrautts — one-click deploy (GPU / CUDA).
+#
+#    docker compose up -d          # pull + start
+#    docker compose logs -f        # watch the first-start model download
+#    curl localhost:8765/health
+#
+#  Requires an NVIDIA driver on the host plus nvidia-container-toolkit.
+#  No GPU? Use docker-compose.cpu.yml instead.
+#
+#  Pin a version instead of tracking latest:
+#    ECHOKRAUTTS_TAG=0.0.0.6 docker compose up -d
+# ============================================================================
+services:
+  echokrautts:
+    image: ghcr.io/rennagasaki/echokrautts:${ECHOKRAUTTS_TAG:-latest}
+    container_name: echokrautts
+    restart: unless-stopped
+    ports:
+      - "${ECHOKRAUTTS_PORT:-8765}:8765"
+    environment:
+      # Engine choice is a restart, never a reinstall — both engines are in the
+      # image. "xtts" clones from audio alone (no transcript) and is
+      # multilingual per request; "f5" loads ONE language finetune per process.
+      F5W_TTS_BACKEND: "${F5W_TTS_BACKEND:-xtts}"
+      F5W_LANGUAGE: "${F5W_LANGUAGE:-de}"
+      # Half precision — only takes effect on CUDA, ~1.4x faster on XTTS.
+      F5W_XTTS_FP16: "${F5W_XTTS_FP16:-true}"
+      # Uncomment to require `Authorization: Bearer <key>` on every request.
+      # The container listens on 0.0.0.0 — set this if the port is reachable
+      # from outside the host.
+      # F5W_API_KEY: "change-me"
+    volumes:
+      # Voice samples: drop <name>.wav here, or a folder <name>/ with several
+      # clips of the same voice (one is picked at random per request).
+      - ./samples:/data/samples
+      # Model weights (several GB). Kept out of the image on purpose — they are
+      # non-commercial licensed (F5 finetunes CC-BY-NC-4.0, XTTS-v2 CPML) and
+      # are downloaded here on first start.
+      - ./models:/data/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
