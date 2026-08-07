@@ -148,6 +148,16 @@ class Config:
     vram_reserve_gb: float = 1.5
     per_job_gb: float = 3.0
     max_queue: int = 64
+    # Request limits for /tts, in a sliding one-hour window. 0 = off (default:
+    # a local wrapper serving one game client has no reason to ration itself).
+    # These are NOT back-pressure — ``max_queue`` already answers 503 when the
+    # engine is saturated. See ratelimit.py.
+    rate_limit_per_hour: int = 0
+    rate_limit_per_ip_per_hour: int = 0
+    # Only read X-Forwarded-For when the wrapper sits behind a proxy you control.
+    # Off by default: otherwise any caller can invent an address per request and
+    # the per-IP limit means nothing.
+    trust_forwarded_for: bool = False
     max_chars_per_chunk: int = 250
     # XTTS token-streaming granularity: audio tokens per streamed chunk handed to
     # `inference_stream` (lower = lower first-audio latency, slightly more
@@ -209,11 +219,23 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
     # Choose the target type from the dataclass default when current is None.
     if name in ("parent_pid", "max_workers"):
         return None if raw == "" or raw.lower() == "null" else int(raw)
-    if name in ("port", "max_queue", "max_chars_per_chunk", "stream_chunk_size"):
+    if name in (
+        "port",
+        "max_queue",
+        "max_chars_per_chunk",
+        "stream_chunk_size",
+        "rate_limit_per_hour",
+        "rate_limit_per_ip_per_hour",
+    ):
         return int(raw)
     if name in ("vram_reserve_gb", "per_job_gb"):
         return float(raw)
-    if name in ("asr_for_missing_ref_text", "xtts_fp16", "voicepack_auto_download"):
+    if name in (
+        "asr_for_missing_ref_text",
+        "xtts_fp16",
+        "voicepack_auto_download",
+        "trust_forwarded_for",
+    ):
         low = raw.lower()
         if low in _BOOL_TRUE:
             return True

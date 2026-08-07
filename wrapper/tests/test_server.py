@@ -214,3 +214,76 @@ def test_ui_is_served_and_needs_no_api_key(config):
         assert "Echokrautts" in r.text
         # …while the endpoints it calls stay protected.
         assert c.get("/samples").status_code == 401
+
+
+# ---------------------------------------------------------------- rate limit
+def test_rate_limit_off_by_default(client):
+    for _ in range(5):
+        r = client.post("/tts", json={"sample": "anna_de.wav", "text": "Hallo."})
+        assert r.status_code == 200
+    assert client.get("/health").json()["rate_limit"] == {"enabled": False}
+
+
+def test_global_rate_limit_returns_429_with_retry_after(config):
+    config.rate_limit_per_hour = 2
+    app = create_app(config=config, engine=make_engine(config))
+    with TestClient(app) as c:
+        body = {"sample": "anna_de.wav", "text": "Hallo."}
+        assert c.post("/tts", json=body).status_code == 200
+        assert c.post("/tts", json=body).status_code == 200
+        r = c.post("/tts", json=body)
+        assert r.status_code == 429
+        assert int(r.headers["Retry-After"]) > 0
+        assert "rate limit" in r.json()["detail"]
+
+
+def test_rate_limit_does_not_touch_other_endpoints(config):
+    # The limit protects GPU time, so browsing voices must stay possible even
+    # once /tts is exhausted — otherwise the web UI locks itself out.
+    config.rate_limit_per_hour = 1
+    app = create_app(config=config, engine=make_engine(config))
+    with TestClient(app) as c:
+        body = {"sample": "anna_de.wav", "text": "Hallo."}
+        assert c.post("/tts", json=body).status_code == 200
+        assert c.post("/tts", json=body).status_code == 429
+        assert c.get("/samples").status_code == 200
+        assert c.get("/languages").status_code == 200
+        assert c.get("/health").status_code == 200
+        assert c.get("/").status_code == 200
+
+
+def test_health_reports_rate_limit_usage(config):
+    config.rate_limit_per_hour = 5
+    app = create_app(config=config, engine=make_engine(config))
+    with TestClient(app) as c:
+        c.post("/tts", json={"sample": "anna_de.wav", "text": "Hallo."})
+        snap = c.get("/health").json()["rate_limit"]
+    assert snap["enabled"] is True
+    assert snap["per_hour"] == 5
+    assert snap["used_this_window"] == 1
+
+
+def test_a_rejected_request_never_reaches_the_engine(config):
+    # 429 is decided before admission, so a hammering caller cannot fill the
+    # queue and turn everyone else's requests into 503s.
+    config.rate_limit_per_hour = 1
+    engine = make_engine(config)
+    app = create_app(config=config, engine=engine)
+    with TestClient(app) as c:
+        body = {"sample": "anna_de.wav", "text": "Hallo."}
+        c.post("/tts", json=body)
+        before = engine._pending
+        assert c.post("/tts", json=body).status_code == 429
+        assert engine._pending == before
+
+
+def test_untrusted_forwarded_for_cannot_dodge_the_per_ip_limit(config):
+    config.rate_limit_per_ip_per_hour = 1
+    app = create_app(config=config, engine=make_engine(config))
+    with TestClient(app) as c:
+        body = {"sample": "anna_de.wav", "text": "Hallo."}
+        assert c.post("/tts", json=body).status_code == 200
+        # A caller inventing a fresh address per request must not get a fresh
+        # bucket while trust_forwarded_for is off.
+        r = c.post("/tts", json=body, headers={"X-Forwarded-For": "9.9.9.9"})
+        assert r.status_code == 429

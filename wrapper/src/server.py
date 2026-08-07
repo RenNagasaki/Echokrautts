@@ -30,6 +30,7 @@ from .config import Config, load_config
 from .engine import Engine, QueueFull, TtsParams
 from .gpu_detect import detect_backend
 from .jobs import JobRegistry
+from .ratelimit import RateLimitExceeded, RateLimiter, client_address
 from .samples import InvalidSample, SampleNotFound
 
 
@@ -185,6 +186,12 @@ def create_app(
 
     app = FastAPI(title="F5-TTS Wrapper", lifespan=lifespan)
     api_key_dep = _require_api_key(config)
+    # One limiter per app: its window is process state, like the engine's queue.
+    limiter = RateLimiter(
+        per_hour=config.rate_limit_per_hour,
+        per_ip_per_hour=config.rate_limit_per_ip_per_hour,
+    )
+    app.state.limiter = limiter
 
     def _engine(request: Request) -> Engine:
         return request.app.state.engine
@@ -208,6 +215,17 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc))
         except SampleNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc))
+        # Rate limit BEFORE admission: a rejected caller must not touch the
+        # queue at all. The two are different answers — 429 "you have had your
+        # share this hour" vs 503 "busy right now, retry shortly".
+        try:
+            limiter.check(client_address(request, config.trust_forwarded_for))
+        except RateLimitExceeded as exc:
+            raise HTTPException(
+                status_code=429,
+                detail=str(exc),
+                headers={"Retry-After": str(exc.retry_after)},
+            )
         try:
             eng.admit()
         except QueueFull as exc:
@@ -293,7 +311,7 @@ def create_app(
 
     @app.get("/health")
     async def health(request: Request):
-        return _engine(request).health()
+        return {**_engine(request).health(), "rate_limit": limiter.snapshot()}
 
     @app.get("/", include_in_schema=False)
     async def ui():

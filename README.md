@@ -114,6 +114,8 @@ no separate Docker configuration schema. The ones that actually matter in a cont
 | `F5W_API_KEY` | unset | Requires `Authorization: Bearer <key>` on every endpoint. **Set it if the port is reachable from anywhere but the host** — the server binds `0.0.0.0`. |
 | `F5W_MAX_WORKERS` | unset (cap 4) | **Upper cap**, not a fixed count: the pool size is derived from free VRAM at startup (`(free − F5W_VRAM_RESERVE_GB) ÷ F5W_PER_JOB_GB`) and then capped by this. Set `1` to force a single worker — sensible on CPU or a small GPU. |
 | `F5W_VOICEPACK_AUTO_DOWNLOAD` | `true` | Fetch the Echokraut voice pack when the samples volume is empty. Set `false` if you only ever use your own voices. |
+| `F5W_RATE_LIMIT_PER_HOUR` · `F5W_RATE_LIMIT_PER_IP_PER_HOUR` | `0` (off) | Sliding-window request limits on `/tts` → 429 + `Retry-After`. Worth setting whenever the port is reachable beyond the host; see [Rate limits](#rate-limits). |
+| `F5W_TRUST_FORWARDED_FOR` | `false` | Take the caller address from `X-Forwarded-For`. Only behind a proxy you control — a container behind one otherwise counts every caller as the proxy. |
 | `F5W_GPU_BACKEND` | `auto` (cuda image) · `cpu` · `rocm` | Forces the hardware backend instead of probing. Each image ships the right value; override only to deliberately fall back (`cpu`). Values: `auto`, `cuda`, `rocm`, `dml`, `xpu`, `cpu`. |
 | `F5W_SAMPLES_DIR` / `F5W_MODELS_DIR` | `/data/samples` · `/data/models` | Only change these if you mount somewhere else — the defaults match the volumes above. |
 | `F5W_PORT` / `F5W_HOST` | `8765` · `0.0.0.0` | Bind address inside the container. |
@@ -295,13 +297,35 @@ no CDN, works offline and inside the container.
 | `GET /`              | The built-in [web UI](#web-ui). The only endpoint never behind the API key. |
 | `POST /cancel/{id}`  | Cancel a running job.                                              |
 | `GET /jobs/{id}`     | Live progress (`sentences_done`/`sentences_total`/`percent`).      |
-| `GET /health`        | Backend/device/worker/queue status.                               |
+| `GET /health`        | Backend/device/worker/queue status, plus `rate_limit` usage.       |
 | `POST /shutdown`     | Graceful shutdown.                                                 |
 
 Configuration lives in `wrapper/config.json` (overridable by `F5W_*` env vars and `--kebab-case` CLI
 flags; precedence JSON < ENV < CLI). The server **binds `0.0.0.0` by default** so the host reaches it
 with no config edit; this also exposes it on your LAN, so set an `api_key` (then all requests need
 `Authorization: Bearer <key>`) — or narrow `host` back to `127.0.0.1` — if that isn't what you want.
+
+### Rate limits
+
+Off by default — a wrapper serving one game client has no reason to ration itself. Turn them on when
+the port is reachable by more than you:
+
+| Setting | Meaning |
+| --- | --- |
+| `rate_limit_per_hour` | Ceiling across **all** callers. |
+| `rate_limit_per_ip_per_hour` | Ceiling **per caller address**. Both may be set; the stricter one answers first. |
+| `trust_forwarded_for` | Read `X-Forwarded-For` instead of the socket address. **Only enable behind a proxy you control** — otherwise a caller invents an address per request and the per-IP limit means nothing. |
+
+Both use a **sliding** window, not hourly buckets: with buckets you could spend a full quota at 10:59
+and another at 11:01. Only requests that were actually accepted count, so a client that keeps
+retrying is not extending its own lockout. Exceeding a limit gives **429** with a `Retry-After`
+header pointing at the moment the next slot frees up.
+
+This is not back-pressure. `max_queue` already answers **503** when the engine is saturated
+("busy right now"); a 429 says "you have had your share this hour". Both stay in place, and the rate
+limit is checked first so a rejected caller never occupies queue space. Only `/tts` is limited —
+`/samples`, `/languages`, `/health` and the web UI keep working, or the page would lock itself out.
+`GET /health` reports the current usage.
 
 ## Voice samples
 
