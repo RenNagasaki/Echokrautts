@@ -43,13 +43,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # torch is pinned per variant: the ROCm index does not carry our 2.7.0
+        # pin (rocm6.4 ships 2.8.0), and 2.8 is the newest torchaudio whose
+        # `load` still decodes natively — 2.9 aliases it to torchcodec, which
+        # would drag in system FFmpeg.
         include:
           - variant: cuda
             suffix: ""
+            gpu_backend: auto
+            torch: "2.7.0"
             torch_index: https://download.pytorch.org/whl/cu128
           - variant: cpu
             suffix: "-cpu"
+            gpu_backend: cpu
+            torch: "2.7.0"
             torch_index: https://download.pytorch.org/whl/cpu
+          - variant: rocm
+            suffix: "-rocm"
+            gpu_backend: rocm
+            torch: "2.8.0"
+            torch_index: https://download.pytorch.org/whl/rocm6.4
 
     steps:
       - name: Free disk space
@@ -111,6 +124,9 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           build-args: |
             TORCH_INDEX_URL=${{ matrix.torch_index }}
+            TORCH_VERSION=${{ matrix.torch }}
+            TORCHAUDIO_VERSION=${{ matrix.torch }}
+            GPU_BACKEND=${{ matrix.gpu_backend }}
             ECHOKRAUTTS_VERSION=${{ steps.meta.outputs.version }}
             VARIANT=${{ matrix.variant }}
           provenance: false

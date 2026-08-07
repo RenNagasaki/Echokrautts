@@ -275,19 +275,35 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
         ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten vorhanden", skipped=True)
         return
     ndjson.progress(index, TOTAL_STEPS, step, "Erstelle venv …")
+    # A backend may demand its own interpreter: AMD's native-Windows ROCm wheels
+    # are cp312-only, while everything else runs on the configured 3.11. uv
+    # fetches a missing Python itself, so this needs no extra step.
+    python_version = det.python_version or config.python_version
     # --clear: replace any pre-existing .venv (e.g. one an earlier `uv run`
     # accidentally synced from pyproject) instead of failing "already exists".
     # We own this venv and install the pinned torch into it below.
-    _run_uv(["venv", str(VENV_DIR), "--clear", "--python", config.python_version], index, step)
+    _run_uv(["venv", str(VENV_DIR), "--clear", "--python", python_version], index, step)
 
     py = str(_venv_python())
-    torch_pin = f"torch=={config.torch_version}"
+    torch_version = det.torch_version or config.torch_version
+    torch_pin = f"torch=={torch_version}"
     audio_pin = f"torchaudio=={config.torchaudio_version}"
+
+    if det.wheel_urls:
+        # ROCm on Windows needs its runtime SDK in the venv before torch, and it
+        # is installed from wheel URLs too (AMD publishes no index for Windows).
+        ndjson.progress(
+            index, TOTAL_STEPS, step, "Installiere ROCm-Laufzeit (Windows) …", percent=5
+        )
+        _run_uv(["pip", "install", "--python", py, *det.wheel_urls], index, step)
 
     def install_torch(pct: int) -> None:
         ndjson.progress(
             index, TOTAL_STEPS, step, f"Installiere PyTorch ({det.backend}) …", percent=pct
         )
+        if det.torch_wheel_urls:
+            _run_uv(["pip", "install", "--python", py, *det.torch_wheel_urls], index, step)
+            return
         _run_uv(
             ["pip", "install", "--python", py, torch_pin, audio_pin,
              "--index-url", det.torch_index_url],
@@ -331,15 +347,24 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
     # libtorchcodec"). If that slipped past the re-pin/uninstall, fail loudly so
     # ``deps.done`` is NOT written and the next run rebuilds — never freeze a
     # broken venv behind the marker (SPEC §3 idempotency must not cache garbage).
-    _verify_torch(py, config)
+    _verify_torch(py, config, expected_version=torch_version)
     _verify_transformers(py)
 
     _mark_done(step)
     ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten installiert", done=True)
 
 
-def _verify_torch(py: str, config) -> None:
-    """Assert the venv ended up with the pinned, torchcodec-free torch."""
+def _verify_torch(py: str, config, expected_version: str | None = None) -> None:
+    """Assert the venv ended up with the pinned, torchcodec-free torch.
+
+    ``expected_version`` lets a backend override the configured pin — AMD's
+    native-Windows ROCm build only exists as torch 2.9.1, so comparing against
+    ``config.torch_version`` there would fail a correct install. torchcodec must
+    still be absent either way: ``audio_compat`` keeps ``torchaudio.load``
+    decoding through soundfile, so torchcodec would only re-introduce the FFmpeg
+    dependency the wrapper avoids.
+    """
+    expected = expected_version or config.torch_version
     code = (
         "import json, importlib.util as u, torch;"
         "print(json.dumps({'v': torch.__version__,"
@@ -353,10 +378,10 @@ def _verify_torch(py: str, config) -> None:
     except (ValueError, IndexError) as exc:
         raise FatalError(f"torch verification: unparseable output {proc.stdout!r}") from exc
     base = str(info.get("v", "")).split("+")[0]
-    if base != config.torch_version or info.get("codec"):
+    if base != expected or info.get("codec"):
         raise FatalError(
             f"torch verification failed: installed={info!r}; "
-            f"expected torch=={config.torch_version} and no torchcodec. "
+            f"expected torch=={expected} and no torchcodec. "
             "The project install re-introduced an incompatible torch/torchcodec; "
             "delete .venv and .state/deps.done and rerun."
         )

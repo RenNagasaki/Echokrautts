@@ -23,7 +23,7 @@ on:
         required: true
         default: cuda
         type: choice
-        options: [cuda, cpu, both]
+        options: [cuda, cpu, rocm, all]
       tag:
         description: "Image tag (CPU build appends -cpu)"
         required: true
@@ -41,12 +41,18 @@ jobs:
       - id: set
         run: |
           set -euo pipefail
-          CPU='{"variant":"cpu","suffix":"-cpu","torch_index":"https://download.pytorch.org/whl/cpu"}'
-          CUDA='{"variant":"cuda","suffix":"","torch_index":"https://download.pytorch.org/whl/cu128"}'
+          # torch/torchaudio are pinned PER VARIANT because the ROCm index does
+          # not carry our 2.7.0 pin: rocm6.4 ships 2.8.0, and 2.8 is the newest
+          # torchaudio whose `load` still decodes natively (2.9 aliases it to
+          # torchcodec, which needs system FFmpeg — see the README).
+          CPU='{"variant":"cpu","suffix":"-cpu","gpu_backend":"cpu","torch":"2.7.0","torch_index":"https://download.pytorch.org/whl/cpu"}'
+          CUDA='{"variant":"cuda","suffix":"","gpu_backend":"auto","torch":"2.7.0","torch_index":"https://download.pytorch.org/whl/cu128"}'
+          ROCM='{"variant":"rocm","suffix":"-rocm","gpu_backend":"rocm","torch":"2.8.0","torch_index":"https://download.pytorch.org/whl/rocm6.4"}'
           case "${{ inputs.variant }}" in
             cuda) M="{\"include\":[$CUDA]}" ;;
             cpu)  M="{\"include\":[$CPU]}" ;;
-            both) M="{\"include\":[$CUDA,$CPU]}" ;;
+            rocm) M="{\"include\":[$ROCM]}" ;;
+            all)  M="{\"include\":[$CUDA,$CPU,$ROCM]}" ;;
             *)    echo "unknown variant"; exit 1 ;;
           esac
           echo "matrix=$M" >> "$GITHUB_OUTPUT"
@@ -100,6 +106,9 @@ jobs:
             ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}${{ matrix.suffix }}
           build-args: |
             TORCH_INDEX_URL=${{ matrix.torch_index }}
+            TORCH_VERSION=${{ matrix.torch }}
+            TORCHAUDIO_VERSION=${{ matrix.torch }}
+            GPU_BACKEND=${{ matrix.gpu_backend }}
             ECHOKRAUTTS_VERSION=${{ inputs.tag }}
             VARIANT=${{ matrix.variant }}
           provenance: false

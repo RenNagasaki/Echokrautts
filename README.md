@@ -63,11 +63,20 @@ environment variable, so switching engine or language is a restart, never a rein
 | Tag | Variant | Requires on the host |
 | --- | --- | --- |
 | `ghcr.io/rennagasaki/echokrautts:latest` · `:<version>` | CUDA (cu128) | NVIDIA driver + [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) |
+| `ghcr.io/rennagasaki/echokrautts:latest-rocm` · `:<version>-rocm` | AMD / ROCm 6.4 | amdgpu kernel driver; on Windows: WSL2 + Docker Desktop |
 | `ghcr.io/rennagasaki/echokrautts:latest-cpu` · `:<version>-cpu` | CPU | nothing — but synthesis is far slower than real time |
-| `:main` · `:main-cpu` · `:sha-<commit>` | either | untagged builds from a branch, published on demand |
+| `:main` · `:main-cpu` · `:main-rocm` · `:sha-<commit>` | any | untagged builds from a branch, published on demand |
 
 There is no `nvidia/cuda` base image: the cu128 torch wheels bring their own CUDA runtime, exactly
-like the bare-metal install, and the driver is injected by the container toolkit.
+like the bare-metal install, and the driver is injected by the container toolkit. The same holds for
+ROCm — the rocm wheels carry the ROCm userspace, the host only provides the kernel driver.
+
+**GPU coverage.** The CUDA image needs no per-card tag: `torch 2.7.0+cu128` is compiled for
+`sm_50 … sm_120`, i.e. Maxwell (GTX 900) through Blackwell (RTX 50xx). The limiting factor is the
+host driver, not the card — CUDA 12.x wants ≥ 525 (Linux) / the R525 branch (Windows), and newer
+cards need a newer driver anyway. The ROCm image targets RDNA3/RDNA4 (RX 7900 XTX/XT, RX 9070/XT and
+the matching Pro/Instinct parts); older AMD cards and every AMD GPU under native Windows still land
+on CPU (see [AMD GPUs](#amd-gpus)).
 
 ### Getting it running
 
@@ -104,6 +113,7 @@ no separate Docker configuration schema. The ones that actually matter in a cont
 | `F5W_XTTS_FP16` | unset (`false`) | XTTS half precision, ~1.4× faster. CUDA only — silently ignored on CPU. |
 | `F5W_API_KEY` | unset | Requires `Authorization: Bearer <key>` on every endpoint. **Set it if the port is reachable from anywhere but the host** — the server binds `0.0.0.0`. |
 | `F5W_MAX_WORKERS` | unset (cap 4) | **Upper cap**, not a fixed count: the pool size is derived from free VRAM at startup (`(free − F5W_VRAM_RESERVE_GB) ÷ F5W_PER_JOB_GB`) and then capped by this. Set `1` to force a single worker — sensible on CPU or a small GPU. |
+| `F5W_GPU_BACKEND` | `auto` (cuda image) · `cpu` · `rocm` | Forces the hardware backend instead of probing. Each image ships the right value; override only to deliberately fall back (`cpu`). Values: `auto`, `cuda`, `rocm`, `dml`, `xpu`, `cpu`. |
 | `F5W_SAMPLES_DIR` / `F5W_MODELS_DIR` | `/data/samples` · `/data/models` | Only change these if you mount somewhere else — the defaults match the volumes above. |
 | `F5W_PORT` / `F5W_HOST` | `8765` · `0.0.0.0` | Bind address inside the container. |
 | `F5W_STREAM_CHUNK_SIZE` | `20` | XTTS token-streaming granularity; lower = earlier first audio, slightly more overhead. F5 ignores it. |
@@ -118,10 +128,11 @@ means unset, `F5W_ALLOWED_SAMPLE_EXT` is comma-separated, `F5W_LANGUAGES` is JSO
 `F5W_PARENT_PID` is for the desktop host's watchdog and must stay unset in a container — otherwise
 the server shuts itself down as soon as that PID is not alive.
 
-**Do not pass `--gpus` to the `-cpu` image.** Hardware detection still runs inside the container and
-keys off `nvidia-smi`, which the container toolkit injects — the wrapper would then select a CUDA
-device that the CPU-only torch build cannot serve. GPU image + `--gpus all`, or CPU image + no
-`--gpus`; nothing in between.
+**Each image forces its own backend**, so detection cannot pick something the installed torch build
+cannot serve. That closes two traps that would otherwise be silent: `--gpus all` on the CPU image
+(the injected `nvidia-smi` would make the wrapper choose a CUDA device it has no wheel for), and the
+ROCm image (a slim container has no `rocminfo`, so probing would answer "CPU" and the GPU would sit
+idle). If you override `F5W_GPU_BACKEND=auto` yourself, both traps come back.
 
 **`/health` is the source of truth**: it reports the backend, language and effective fp16 the
 process actually came up with, not what you *meant* to set.
@@ -183,8 +194,16 @@ Two GitHub workflows, both publishing to GHCR:
 - **Docker release** — runs when a GitHub release is published, pushing `<version>` and `latest`
   (plus the `-cpu` pair). Pre-releases skip the `latest` tags.
 
-Locally: `docker build -t echokrautts:dev .` for CUDA, or add
-`--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu` for the CPU variant.
+Locally, the variant is three build args — CUDA is the default:
+
+```bash
+docker build -t echokrautts:dev .                                        # CUDA
+docker build -t echokrautts:dev-cpu  --build-arg GPU_BACKEND=cpu \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu .
+docker build -t echokrautts:dev-rocm --build-arg GPU_BACKEND=rocm \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/rocm6.4 \
+  --build-arg TORCH_VERSION=2.8.0 --build-arg TORCHAUDIO_VERSION=2.8.0 .
+```
 
 ## Hardware / GPU acceleration
 
@@ -194,19 +213,61 @@ The bootstrap **detects your hardware** (the "detect GPU" step) and installs the
 | Hardware | Windows | Linux |
 |----------|---------|-------|
 | **NVIDIA** | ✅ CUDA (cu128 for Blackwell/sm≥12, else cu126) | ✅ CUDA |
-| **AMD** | ⚠️ DirectML detected, but op coverage is insufficient → **falls back to CPU** | ✅ ROCm (reported as a CUDA device) |
+| **AMD** | ✅ ROCm for Radeon 9000 / select 7000 (AMD's cp312 wheels, installed automatically); other cards ⚠️ DirectML → **CPU**. See [AMD GPUs](#amd-gpus) | ✅ ROCm (reported as a CUDA device) |
 | **Intel dGPU** | ⚠️ XPU detected, but XTTS maps it to CPU and F5 self-tests → typically **CPU** | ⚠️ same |
 | **No GPU / other** | 🐢 CPU | 🐢 CPU |
 
 - **Both backends run on any of these** — the question is only *how fast*. On CPU (incl. AMD-on-Windows
   and Intel) expect real-time factor **> 1** (slower than real time): fine for testing, too slow for
   live in-game TTS.
-- **Real AMD acceleration is Linux-only** (ROCm). There is no ROCm PyTorch for Windows, and DirectML
-  can't run the ops these models need — so an AMD card on Windows serves on the CPU.
 - For fragile devices (dml/xpu) the engine runs a tiny **self-test** at startup and rebuilds the worker
   pool on CPU if it fails, so you always get working audio, just not always on the GPU.
 - The **`xtts_fp16`** speedup applies only where the device is CUDA (NVIDIA or ROCm); see
   [TTS backends](#tts-backends).
+- Detection can be overruled with **`gpu_backend`** (`auto` · `cuda` · `rocm` · `rocm_win` · `dml` ·
+  `xpu` · `cpu`).
+  Use it where probing cannot see the truth — inside containers, or to force CPU deliberately. An
+  unknown value is a hard error, never a silent CPU fallback.
+
+### AMD GPUs
+
+**Linux, and Windows via WSL2/Docker:** use the **`-rocm` image**. It ships `torch 2.8.0+rocm6.4` and
+forces `gpu_backend=rocm`, and it covers RDNA3/RDNA4 — RX 7900 XTX/XT, RX 9070/XT and the matching
+Pro/Instinct parts. On a Linux host it needs only the amdgpu kernel driver; on Windows it runs inside
+WSL2 with Docker Desktop, which AMD supports for exactly these cards with a recent Adrenalin driver.
+
+```bash
+docker compose -f docker-compose.rocm.yml up -d
+```
+
+The container is handed `/dev/kfd` and `/dev/dri` instead of `--gpus` — that is how AMD GPUs reach a
+container. Cards whose gfx version ROCm does not accept can often be spoofed to the nearest supported
+one with `HSA_OVERRIDE_GFX_VERSION` (commented out in the compose file).
+
+**Native Windows, no container:** supported through AMD's own ROCm build, automatically. The
+bootstrap reads the display-adapter name and, if it matches AMD's supported hardware (Radeon 9000
+series and select 7000 — the pattern lives in `rocm_windows.gpu_pattern`), installs the ROCm stack
+instead of the DirectML fallback. Nothing to configure; `/health` reports what was chosen.
+
+Three things about that path are unlike every other backend, all of them AMD's doing:
+
+- **Python 3.12.** The wheels are cp312-only, so this one venv is built on 3.12 while the rest of the
+  wrapper runs on the configured 3.11. `uv` fetches the interpreter itself.
+- **Wheels by URL, not an index.** AMD publishes no pip index for Windows, so the ROCm runtime
+  (`rocm_sdk_*`) and torch/torchaudio/torchvision are installed from individual URLs, listed under
+  `rocm_windows` in `config.json`. **Bumping to a newer ROCm release is an edit there, not a code
+  change.**
+- **torch 2.9.1**, whose torchaudio turns `load` into a torchcodec alias that would need system
+  FFmpeg. The wrapper patches `torchaudio.load` back to its bundled soundfile decoder at startup
+  (`src/audio_compat.py`), so the install stays free of external binaries like every other backend.
+
+Because the card is matched **by name**, the engine treats this backend as fragile: if the worker
+fails to build or fails its self-test, it rebuilds on CPU and says so in the log rather than
+refusing to start. Force the decision yourself with `gpu_backend` (`rocm_win` or `cpu`).
+
+Not chosen, for the record: **DirectML**. Microsoft has it in maintenance mode — security fixes
+only, Windows ML is the successor — and `torch-directml` has not been released since September 2024.
+It remains the fallback for AMD cards outside AMD's ROCm list, where it self-tests and lands on CPU.
 
 ## HTTP API
 

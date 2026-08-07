@@ -13,6 +13,23 @@
     "fr": { "arch": "F5TTS_Base", "hf_repo": "RASPIAUDIO/F5-French-MixedSpeakers-reduced", "ckpt_file": "model_last_reduced.pt", "vocab_file": "vocab.txt" },
     "ja": { "arch": "F5TTS_Base", "hf_repo": "Jmica/F5TTS", "ckpt_file": "JA_21999120/model_21999120.pt", "vocab_file": "JA_21999120/vocab_japanese.txt" }
   },
+  "gpu_backend": "auto",
+  "rocm_windows": {
+    "python": "3.12",
+    "torch_version": "2.9.1",
+    "gpu_pattern": "RX\\s*9\\d{3}|RX\\s*7[89]\\d{2}|Radeon\\s+Pro\\s+W7|Radeon\\s+AI\\s+PRO",
+    "wheels": [
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm-7.2.1.tar.gz"
+    ],
+    "torch_wheels": [
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchaudio-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl"
+    ]
+  },
   "samples_dir": "samples",
   "models_dir": "models",
   "max_workers": null,

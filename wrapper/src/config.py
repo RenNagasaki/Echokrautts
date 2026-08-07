@@ -94,6 +94,46 @@ class Config:
             },
         }
     )
+    # Force a hardware backend instead of probing for one. "auto" (default) runs
+    # the usual detection chain; any other value short-circuits it. Needed
+    # wherever the probes cannot see the truth: a slim ROCm container has no
+    # ``rocminfo`` and no ``/opt/rocm``, so detection would fall through to CPU
+    # and the GPU would sit idle. It is also the escape hatch for the inverse
+    # mistake — a CPU-only build that was handed a GPU (``--gpus all``), where
+    # the injected ``nvidia-smi`` makes detection pick a CUDA device that the
+    # installed torch cannot serve. See ``gpu_detect.detect_backend``.
+    gpu_backend: str = "auto"
+    # Native-Windows ROCm install (AMD's own build). Data, not code, so bumping
+    # to a newer ROCm release is an edit here — the URLs are version-specific and AMD
+    # publishes no pip index for Windows, only individual wheels.
+    #
+    # Three things differ from every other backend and all three are AMD's doing:
+    #   * Python 3.12 only (the wheels are cp312; the rest of the wrapper runs 3.11)
+    #   * torch 2.9.1 — and torchaudio 2.9 turned ``load`` into a torchcodec alias
+    #     that needs system FFmpeg, which ``audio_compat`` patches back out
+    #   * wheels by URL, so there is nothing to ``--index-url`` against
+    # ``gpu_pattern`` matches the GPU names AMD lists as supported (Radeon 9000
+    # series and select 7000). Widen it here if AMD adds hardware; a card that
+    # does not match keeps the old DirectML→CPU path instead of installing a
+    # multi-GB stack that cannot run.
+    rocm_windows: dict = field(
+        default_factory=lambda: {
+            "python": "3.12",
+            "torch_version": "2.9.1",
+            "gpu_pattern": r"RX\s*9\d{3}|RX\s*7[89]\d{2}|Radeon\s+Pro\s+W7|Radeon\s+AI\s+PRO",
+            "wheels": [
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl",
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl",
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm-7.2.1.tar.gz",
+            ],
+            "torch_wheels": [
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchaudio-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+            ],
+        }
+    )
     samples_dir: str = "samples"
     models_dir: str = "models"
     max_workers: Optional[int] = None
@@ -174,7 +214,7 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
         raise ValueError(f"invalid bool for {name}: {raw!r}")
     if name == "allowed_sample_ext":
         return [s.strip() for s in raw.split(",") if s.strip()]
-    if name == "languages":
+    if name in ("languages", "rocm_windows"):
         return json.loads(raw)
     if name in ("api_key", "hf_endpoint", "torch_index_override"):
         return None if raw == "" or raw.lower() == "null" else raw

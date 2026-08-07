@@ -79,6 +79,16 @@ FROM python:${PYTHON_VERSION}-slim AS runtime
 
 ARG ECHOKRAUTTS_VERSION=dev
 ARG VARIANT=cuda
+# Hardware backend baked into the image, because the runtime probes cannot see
+# the truth from inside a slim container:
+#   cuda → "auto"  (nvidia-smi is injected by the container toolkit, and auto
+#                   degrades to CPU gracefully when no GPU was passed)
+#   rocm → "rocm"  (no rocminfo, no /opt/rocm here → auto would answer CPU and
+#                   the GPU would sit idle)
+#   cpu  → "cpu"   (closes the --gpus-on-a-CPU-image trap: the injected
+#                   nvidia-smi would otherwise select a CUDA device this torch
+#                   build cannot serve)
+ARG GPU_BACKEND=auto
 
 LABEL org.opencontainers.image.title="Echokrautts" \
       org.opencontainers.image.description="Streaming voice-cloning TTS wrapper (F5-TTS + XTTS-v2) with an HTTP API" \
@@ -105,6 +115,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 # the image is read-only. Both are absolute paths, which config.py honours.
 ENV F5W_SAMPLES_DIR=/data/samples \
     F5W_MODELS_DIR=/data/models \
+    F5W_GPU_BACKEND=${GPU_BACKEND} \
     F5W_HOST=0.0.0.0 \
     F5W_PORT=8765 \
     F5W_TTS_BACKEND=xtts \

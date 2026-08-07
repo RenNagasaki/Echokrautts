@@ -32,13 +32,21 @@ TORCH_INDEX = {
 
 @dataclass
 class Detection:
-    backend: str  # "cuda" | "rocm" | "dml" | "xpu" | "cpu"
+    backend: str  # "cuda" | "rocm" | "rocm_win" | "dml" | "xpu" | "cpu"
     device: str  # torch device string: "cuda" | "dml" | "xpu" | "cpu"
     torch_index_url: str
     extra_packages: list[str] = field(default_factory=list)
     max_workers_hint: int = 1
     free_vram_gb: float | None = None
     detail: str = ""
+    # Set only by backends that install from individual wheel URLs instead of a
+    # pip index — currently just native-Windows ROCm, where AMD publishes no
+    # index. ``python_version`` overrides the configured interpreter for the
+    # venv, because those wheels are built for exactly one Python.
+    wheel_urls: list[str] = field(default_factory=list)
+    torch_wheel_urls: list[str] = field(default_factory=list)
+    python_version: str | None = None
+    torch_version: str | None = None
 
 
 # --------------------------------------------------------------------- probes
@@ -91,12 +99,68 @@ def _has_amd_gpu() -> bool:
     return procutil.try_run(["rocminfo"]) is not None
 
 
-def _detect_amd() -> Detection | None:
+def _gpu_names() -> list[str]:
+    """Display-adapter names (Windows only; empty elsewhere or on failure)."""
+    if not procutil.IS_WINDOWS:
+        return []
+    out = procutil.try_run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+        ]
+    )
+    return [line.strip() for line in (out or "").splitlines() if line.strip()]
+
+
+def rocm_windows_candidate(config: Config) -> str | None:
+    """Return the GPU name if native-Windows ROCm applies to this machine.
+
+    AMD supports ROCm on Windows for a subset of its cards (Radeon 9000 series
+    and select 7000), so the adapter name is matched against
+    ``config.rocm_windows["gpu_pattern"]``. Matching by name is a heuristic —
+    but the alternative, installing a multi-GB ROCm stack on every AMD machine
+    and finding out at first inference, is worse. A card that does not match
+    keeps the existing DirectML→CPU path.
+    """
+    settings = config.rocm_windows or {}
+    pattern = settings.get("gpu_pattern")
+    if not pattern or not settings.get("torch_wheels"):
+        return None
+    for name in _gpu_names():
+        if re.search(pattern, name, re.IGNORECASE):
+            return name
+    return None
+
+
+def _rocm_windows_detection(config: Config, gpu_name: str) -> Detection:
+    settings = config.rocm_windows
+    return Detection(
+        backend="rocm_win",
+        # HIP presents itself as CUDA, on Windows as much as on Linux.
+        device="cuda",
+        # Nothing to point an index at — AMD ships individual wheels. The URL is
+        # kept only so the field is never empty for callers that log it.
+        torch_index_url=TORCH_INDEX["cpu"],
+        wheel_urls=list(settings.get("wheels", [])),
+        torch_wheel_urls=list(settings.get("torch_wheels", [])),
+        python_version=settings.get("python"),
+        torch_version=settings.get("torch_version"),
+        detail=f"AMD on Windows → ROCm ({gpu_name})",
+    )
+
+
+def _detect_amd(config: Config) -> Detection | None:
     if not _has_amd_gpu():
         return None
     if procutil.IS_WINDOWS:
-        # DirectML: CPU torch + torch-directml. Op coverage is limited, so the
-        # engine runs a self-test and falls back to CPU if it fails (SPEC §4.2).
+        gpu_name = rocm_windows_candidate(config)
+        if gpu_name:
+            return _rocm_windows_detection(config, gpu_name)
+        # Not on AMD's Windows-ROCm list → DirectML, as before. DirectML is in
+        # maintenance mode upstream and its op coverage does not carry these
+        # models, so the engine self-tests it and falls back to CPU (SPEC §4.2).
         return Detection(
             backend="dml",
             device="dml",
@@ -177,9 +241,59 @@ def _apply_worker_hint(det: Detection, config: Config) -> Detection:
     return det
 
 
+# Backends that can be forced via ``config.gpu_backend``, with the device and
+# wheel index each implies. Kept as data so a new backend needs one entry, not a
+# branch. ROCm reports itself as a CUDA device (HIP masquerades as CUDA).
+FORCED_BACKENDS = {
+    "cuda": ("cuda", "cu128", []),
+    "rocm": ("cuda", "rocm", []),
+    # rocm_win is handled separately in detect_backend: its install comes from
+    # config (wheel URLs, Python version), not from this table.
+    "rocm_win": ("cuda", "cpu", []),
+    "dml": ("dml", "dml", ["torch-directml"]),
+    "xpu": ("xpu", "xpu", ["intel-extension-for-pytorch"]),
+    "cpu": ("cpu", "cpu", []),
+}
+
+
+def _forced_detection(backend: str) -> Detection:
+    """Build a Detection for an explicitly configured backend (no probing).
+
+    Free VRAM stays unknown here — the probe that would have reported it is
+    exactly what the caller opted out of — so ``_apply_worker_hint`` falls back
+    to its conservative default. Set ``max_workers`` if you want more.
+    """
+    device, index_key, extras = FORCED_BACKENDS[backend]
+    return Detection(
+        backend=backend,
+        device=device,
+        torch_index_url=TORCH_INDEX[index_key],
+        extra_packages=list(extras),
+        detail=f"{backend} forced by config (gpu_backend={backend})",
+    )
+
+
 def detect_backend(config: Config) -> Detection:
-    """Run the full detection chain and return the chosen backend."""
-    det = _detect_nvidia() or _detect_amd() or _detect_intel()
+    """Run the full detection chain and return the chosen backend.
+
+    ``config.gpu_backend`` short-circuits the chain. An unknown value is a hard
+    error rather than a silent fallback: it is always a typo, and answering a
+    misspelled "rocm" with a CPU pool looks like the wrapper simply being slow.
+    """
+    forced = (config.gpu_backend or "auto").strip().lower()
+    if forced != "auto":
+        if forced not in FORCED_BACKENDS:
+            raise ValueError(
+                f"gpu_backend={config.gpu_backend!r} is not one of "
+                f"'auto', {', '.join(sorted(FORCED_BACKENDS))}"
+            )
+        det = (
+            _rocm_windows_detection(config, "forced")
+            if forced == "rocm_win"
+            else _forced_detection(forced)
+        )
+    else:
+        det = _detect_nvidia() or _detect_amd(config) or _detect_intel()
     if det is None:
         det = Detection(
             backend="cpu",

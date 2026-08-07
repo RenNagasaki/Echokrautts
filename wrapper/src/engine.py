@@ -25,7 +25,7 @@ from typing import AsyncIterator, Callable, Iterator, Optional, Protocol
 
 import numpy as np
 
-from . import ndjson
+from . import audio_compat, ndjson
 from .config import Config
 from .gpu_detect import Detection
 from .jobs import CANCELLED, DONE, ERROR, Job, JobRegistry
@@ -228,16 +228,34 @@ class Engine:
             return
         self._started = True
         self._loop = asyncio.get_running_loop()
+        # Before any worker (and therefore any engine library) is imported: make
+        # sure torchaudio.load decodes without TorchCodec/FFmpeg. Only matters on
+        # torchaudio >= 2.9, i.e. AMD's native-Windows ROCm build.
+        audio_compat.ensure_native_audio_loading()
         count = max(1, self._detection.max_workers_hint)
         device = self._detection.device
         for i in range(count):
-            worker = await self._build_worker(i, device)
-            # Self-test DirectML/XPU; fall back to CPU on insufficient coverage.
-            if device in ("dml", "xpu"):
-                ok = await self._loop.run_in_executor(None, worker.self_test)
-                if not ok:
+            # Backends whose op coverage cannot be assumed fall back to CPU
+            # instead of failing startup. DirectML/XPU are incomplete by nature;
+            # native-Windows ROCm is included because the GPU was matched by
+            # ADAPTER NAME (see gpu_detect) — the card may not really be on
+            # AMD's supported list, and a CPU worker beats a dead server.
+            fragile = device in ("dml", "xpu") or self.backend == "rocm_win"
+            if not fragile:
+                worker = await self._build_worker(i, device)
+            else:
+                reason = ""
+                try:
+                    worker = await self._build_worker(i, device)
+                    # A worker that builds can still lack the ops to run.
+                    if not await self._loop.run_in_executor(None, worker.self_test):
+                        reason = "self-test failed"
+                except Exception as exc:  # noqa: BLE001 — any init failure means "no GPU here"
+                    # e.g. HIP/DirectML refusing the device outright.
+                    reason = f"worker init failed: {exc}"
+                if reason:
                     ndjson.log(
-                        f"{device} self-test failed; worker {i} falling back to CPU",
+                        f"{device}/{self.backend} {reason}; worker {i} falling back to CPU",
                         level="warning",
                     )
                     device = "cpu"
