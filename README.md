@@ -269,12 +269,29 @@ Not chosen, for the record: **DirectML**. Microsoft has it in maintenance mode �
 only, Windows ML is the successor — and `torch-directml` has not been released since September 2024.
 It remains the fallback for AMD cards outside AMD's ROCm list, where it self-tests and lands on CPU.
 
+## Web UI
+
+Open **`http://localhost:8765/`** in a browser: pick a voice, pick a language, type text, hit
+Generate, listen. It is a single self-contained HTML file the wrapper serves itself — no build step,
+no CDN, works offline and inside the container.
+
+- **Voices** come from `/samples`; if the folder is empty the page says so instead of failing.
+- **Language** is driven by `/languages`, which applies the backend rule: with **XTTS** you can pick
+  any supported language per request, with **F5** the selector is pre-filled with the loaded model's
+  language and **disabled** — that backend serves one language per process.
+- **Audio**: the page asks `/tts` for `format: "wav"`, because browsers cannot play the raw PCM the
+  plugin streams. It also prints how much audio was produced and the real-time factor.
+- **API key**: if `api_key` is set, the page itself still loads (you have to be able to type the key
+  somewhere) and everything it calls stays protected. The key is remembered in `localStorage`.
+
 ## HTTP API
 
 | Method & path        | Purpose                                                            |
 |----------------------|--------------------------------------------------------------------|
-| `POST /tts`          | Streaming synthesis. Body = raw PCM (`pcm_s16le`, mono). Metadata in `X-Job-Id` / `X-Sample-Rate` / `X-Channels` / `X-Sample-Format` headers. |
+| `POST /tts`          | Streaming synthesis. Body = raw PCM (`pcm_s16le`, mono). Metadata in `X-Job-Id` / `X-Sample-Rate` / `X-Channels` / `X-Sample-Format` headers. Add `"format": "wav"` to get a buffered `audio/wav` file instead (what the web UI uses; gives up streaming). |
 | `GET /samples`       | Usable voice names (`?details=true` adds `has_ref_text`/`bytes`/`count`). |
+| `GET /languages`     | What may go in a request's `language`: `{active, options, locked, reason}`. `locked` is true on F5 (one model per process). |
+| `GET /`              | The built-in [web UI](#web-ui). The only endpoint never behind the API key. |
 | `POST /cancel/{id}`  | Cancel a running job.                                              |
 | `GET /jobs/{id}`     | Live progress (`sentences_done`/`sentences_total`/`percent`).      |
 | `GET /health`        | Backend/device/worker/queue status.                               |

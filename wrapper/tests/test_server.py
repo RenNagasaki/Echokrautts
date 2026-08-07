@@ -137,3 +137,80 @@ def test_api_key_enforced(config):
         # Correct key → ok.
         ok = c.get("/samples", headers={"Authorization": "Bearer secret"})
         assert ok.status_code == 200
+
+
+# ------------------------------------------------------------- wav + web UI
+def test_tts_wav_format_returns_a_playable_file(client):
+    import io
+    import wave
+
+    r = client.post(
+        "/tts", json={"sample": "anna_de.wav", "text": "Hallo.", "format": "wav"}
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("audio/wav")
+    with wave.open(io.BytesIO(r.content)) as fh:
+        assert fh.getnchannels() == 1
+        assert fh.getsampwidth() == 2
+        assert fh.getnframes() > 0
+
+
+def test_tts_wav_carries_the_same_metadata_headers(client):
+    r = client.post(
+        "/tts", json={"sample": "anna_de.wav", "text": "Hallo.", "format": "wav"}
+    )
+    assert r.headers["X-Job-Id"]
+    assert r.headers["X-Sample-Rate"] == "24000"
+
+
+def test_tts_defaults_to_raw_pcm(client):
+    r = client.post("/tts", json={"sample": "anna_de.wav", "text": "Hallo."})
+    assert r.headers["content-type"].startswith("audio/pcm")
+    assert not r.content.startswith(b"RIFF")
+
+
+def test_tts_wav_holds_the_same_audio_as_the_pcm_stream(client):
+    body = {"sample": "anna_de.wav", "text": "Hallo."}
+    pcm = client.post("/tts", json=body).content
+    blob = client.post("/tts", json=dict(body, format="wav")).content
+    assert blob[44:] == pcm  # header prepended, payload untouched
+
+
+def test_unknown_format_is_a_400(client):
+    r = client.post(
+        "/tts", json={"sample": "anna_de.wav", "text": "Hallo.", "format": "mp3"}
+    )
+    assert r.status_code == 400
+    assert "format" in r.json()["detail"]
+
+
+def test_languages_locked_for_f5(client):
+    # F5 loads one finetune per process → the UI must grey the selector out.
+    body = client.get("/languages").json()
+    assert body["locked"] is True
+    assert body["options"] == ["de"]
+    assert body["active"] == "de"
+
+
+def test_languages_open_for_xtts(config):
+    config.tts_backend = "xtts"
+    app = create_app(config=config, engine=make_engine(config))
+    with TestClient(app) as c:
+        body = c.get("/languages").json()
+    assert body["locked"] is False
+    assert body["active"] == "de"
+    assert "en" in body["options"] and "ja" in body["options"]
+    assert body["options"] == sorted(body["options"])
+
+
+def test_ui_is_served_and_needs_no_api_key(config):
+    # You must be able to load the page in order to type the key into it.
+    config.api_key = "secret"
+    app = create_app(config=config, engine=make_engine(config))
+    with TestClient(app) as c:
+        r = c.get("/")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/html")
+        assert "Echokrautts" in r.text
+        # …while the endpoints it calls stay protected.
+        assert c.get("/samples").status_code == 401

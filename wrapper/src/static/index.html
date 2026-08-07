@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<!--
+  Echokrautts test page.
+
+  One self-contained file: no build step, no CDN, no framework — it has to work
+  inside the container and on a machine with no internet. Served by the wrapper
+  at "/" (see server.py); everything it calls is the normal HTTP API.
+
+  Audio: /tts is asked for format:"wav", because a browser cannot play the raw
+  PCM the plugin streams. The response is turned into a blob URL and handed to
+  a plain <audio> element.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Echokrautts</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #14161a; --panel: #1c1f26; --line: #2c313b;
+    --fg: #e7e9ee; --muted: #949cad; --accent: #7aa2f7; --err: #f77;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f5f6f8; --panel:#fff; --line:#dfe3ea; --fg:#1a1d23; --muted:#5b6472; --accent:#2f6fd0; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1rem; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 46rem; margin: 0 auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+  .sub { color: var(--muted); margin: 0 0 1.5rem; font-size: .9rem; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1.25rem; }
+  .row { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .row > label { flex: 1 1 12rem; display: flex; flex-direction: column; gap: .35rem; }
+  label > span { font-size: .8rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  select, input, textarea, button {
+    font: inherit; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: .5rem .6rem;
+  }
+  textarea { width: 100%; min-height: 7rem; resize: vertical; }
+  select:disabled, input:disabled { opacity: .55; cursor: not-allowed; }
+  button {
+    background: var(--accent); color: #fff; border: 0; padding: .6rem 1.2rem;
+    border-radius: 6px; cursor: pointer; font-weight: 600;
+  }
+  button:disabled { opacity: .5; cursor: progress; }
+  .hint { font-size: .8rem; color: var(--muted); margin-top: .35rem; }
+  .status { margin-top: 1rem; font-size: .9rem; min-height: 1.4rem; }
+  .status.error { color: var(--err); }
+  audio { width: 100%; margin-top: 1rem; }
+  footer { margin-top: 1rem; font-size: .8rem; color: var(--muted); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Echokrautts</h1>
+  <p class="sub" id="meta">connecting …</p>
+
+  <div class="panel">
+    <div class="row">
+      <label>
+        <span>Voice</span>
+        <select id="voice"></select>
+        <span class="hint" id="voiceHint"></span>
+      </label>
+      <label>
+        <span>Language</span>
+        <select id="lang"></select>
+        <span class="hint" id="langHint"></span>
+      </label>
+    </div>
+
+    <label style="display:block">
+      <span>Text</span>
+      <textarea id="text" placeholder="Type something to say …">Hallo Welt, das ist ein Test.</textarea>
+    </label>
+
+    <div class="row" style="margin-top:1rem; align-items:flex-end">
+      <label style="flex:0 0 7rem">
+        <span>Speed</span>
+        <input id="speed" type="number" value="1.0" step="0.05" min="0.5" max="2.0">
+      </label>
+      <label style="flex:1 1 12rem">
+        <span>API key <em style="text-transform:none">(only if configured)</em></span>
+        <input id="key" type="password" placeholder="leave empty if unset" autocomplete="off">
+      </label>
+      <div style="flex:0 0 auto; padding-bottom:.1rem">
+        <button id="go">Generate</button>
+      </div>
+    </div>
+
+    <div class="status" id="status"></div>
+    <audio id="player" controls hidden></audio>
+  </div>
+
+  <footer>
+    Raw streaming PCM stays available for API clients — this page requests
+    <code>format: "wav"</code> so the browser can play it.
+    <a href="/health">/health</a> · <a href="/samples">/samples</a>
+  </footer>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const KEY_STORE = "echokrautts.apikey";
+
+function authHeaders() {
+  const key = $("key").value.trim();
+  return key ? { Authorization: "Bearer " + key } : {};
+}
+
+function say(msg, isError) {
+  const el = $("status");
+  el.textContent = msg;
+  el.className = "status" + (isError ? " error" : "");
+}
+
+async function getJSON(path) {
+  const res = await fetch(path, { headers: authHeaders() });
+  if (!res.ok) {
+    // 401 is the interesting one: the server has an api_key configured.
+    const detail = res.status === 401
+      ? "unauthorized — enter the API key below"
+      : await res.text();
+    throw new Error(path + ": " + res.status + " " + detail);
+  }
+  return res.json();
+}
+
+async function loadMeta() {
+  const health = await getJSON("/health");
+  $("meta").textContent =
+    `${health.tts_backend.toUpperCase()} on ${health.device} (${health.backend})` +
+    ` · ${health.workers} worker(s)` +
+    (health.xtts_fp16 ? " · fp16" : "");
+
+  // The language selector is driven by /languages, which knows the backend
+  // rule: F5 loads ONE model per process, so the field is locked there.
+  const langs = await getJSON("/languages");
+  const sel = $("lang");
+  sel.innerHTML = "";
+  for (const code of langs.options) {
+    const opt = document.createElement("option");
+    opt.value = code;
+    opt.textContent = code;
+    sel.appendChild(opt);
+  }
+  sel.value = langs.active;
+  sel.disabled = langs.locked;
+  $("langHint").textContent = langs.reason || "";
+
+  const voices = await getJSON("/samples");
+  const vs = $("voice");
+  vs.innerHTML = "";
+  const names = Array.isArray(voices) ? voices : (voices.samples || []);
+  for (const name of names) {
+    const opt = document.createElement("option");
+    opt.value = typeof name === "string" ? name : name.name;
+    opt.textContent = opt.value;
+    vs.appendChild(opt);
+  }
+  if (!names.length) {
+    $("voiceHint").textContent = "no samples found — drop a .wav into the samples folder";
+    $("go").disabled = true;
+  } else {
+    $("voiceHint").textContent = names.length + " available";
+    $("go").disabled = false;
+  }
+}
+
+async function generate() {
+  const text = $("text").value.trim();
+  if (!text) { say("nothing to say", true); return; }
+
+  const btn = $("go");
+  btn.disabled = true;
+  say("generating …");
+  const started = performance.now();
+
+  try {
+    const res = await fetch("/tts", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
+      body: JSON.stringify({
+        sample: $("voice").value,
+        text: text,
+        language: $("lang").value,
+        speed: parseFloat($("speed").value) || 1.0,
+        format: "wav",
+      }),
+    });
+    if (!res.ok) throw new Error(res.status + " " + (await res.text()));
+
+    const blob = await res.blob();
+    const player = $("player");
+    // Free the previous clip's blob, or every run leaks one.
+    if (player.dataset.url) URL.revokeObjectURL(player.dataset.url);
+    const url = URL.createObjectURL(blob);
+    player.dataset.url = url;
+    player.src = url;
+    player.hidden = false;
+    player.play().catch(() => { /* autoplay may be blocked; controls still work */ });
+
+    // 44 = RIFF header, 2 bytes per sample, mono.
+    const seconds = (blob.size - 44) / 2 / 24000;
+    const took = (performance.now() - started) / 1000;
+    say(`${seconds.toFixed(1)}s of audio in ${took.toFixed(1)}s (rtf ${(took / seconds).toFixed(2)})`);
+  } catch (err) {
+    say(String(err.message || err), true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("go").addEventListener("click", generate);
+$("key").addEventListener("change", () => {
+  localStorage.setItem(KEY_STORE, $("key").value);
+  loadMeta().catch((e) => say(String(e.message || e), true));
+});
+
+$("key").value = localStorage.getItem(KEY_STORE) || "";
+loadMeta().catch((e) => say(String(e.message || e), true));
+</script>
+</body>
+</html>

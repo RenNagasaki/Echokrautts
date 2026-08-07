@@ -15,15 +15,27 @@ import signal
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel, Field
 
-from . import ndjson
+from pathlib import Path
+
+from . import ndjson, wav
 from .config import Config, load_config
 from .engine import Engine, QueueFull, TtsParams
 from .gpu_detect import detect_backend
 from .jobs import JobRegistry
 from .samples import InvalidSample, SampleNotFound
+
+
+# The built-in test page. Single self-contained file, no build step and no CDN,
+# so it works in the container and on an offline machine alike.
+UI_INDEX = Path(__file__).resolve().parent / "static" / "index.html"
 
 
 class TtsRequest(BaseModel):
@@ -33,6 +45,13 @@ class TtsRequest(BaseModel):
     ref_text: Optional[str] = None
     speed: float = 1.0
     nfe_step: int = 32
+    # "pcm" (default) streams raw s16le as it is generated — what the plugin
+    # consumes. "wav" buffers the whole clip and prepends a RIFF header, because
+    # a browser cannot play headerless PCM; it is what the built-in web UI uses.
+    # The streaming property is deliberately given up in that mode: a correct
+    # RIFF header needs the total length, and the alternative (a header claiming
+    # an unknown size) is honoured inconsistently across browsers.
+    format: str = "pcm"
 
 
 def _resolve_language(config: Config, requested: Optional[str]) -> str:
@@ -178,6 +197,10 @@ def create_app(
         # one finetune per process, so it ignores the request language and uses
         # its loaded model.
         language = _resolve_language(config, req.language)
+        if req.format not in ("pcm", "wav"):
+            raise HTTPException(
+                status_code=400, detail=f"format must be 'pcm' or 'wav', not {req.format!r}"
+            )
         # Validate + admit BEFORE the 200 stream starts, so error codes are real.
         try:
             audio_path = eng.samples.resolve_path(req.sample)
@@ -205,11 +228,51 @@ def create_app(
             "X-Channels": "1",
             "X-Sample-Format": "pcm_s16le",
         }
+        if req.format == "wav":
+            # Buffered on purpose — see TtsRequest.format. Everything else about
+            # the request (validation, admission, job, cancel) is identical.
+            pcm = bytearray()
+            async for part in eng.stream(job, params, audio_path):
+                pcm += part
+            return Response(
+                content=wav.wrap_pcm(bytes(pcm), sample_rate=eng.sample_rate),
+                media_type="audio/wav",
+                headers=headers,
+            )
         return StreamingResponse(
             eng.stream(job, params, audio_path),
             media_type="audio/pcm",
             headers=headers,
         )
+
+    @app.get("/languages", dependencies=[Depends(api_key_dep)])
+    async def languages(request: Request):
+        """What the caller may put in a request's ``language`` field.
+
+        Exists for the web UI, which has to grey the selector out for F5: that
+        backend loads ONE finetune per process, so a per-request language is
+        ignored (never rejected). Deriving that from /health alone would mean
+        teaching the page the backend rules — better answered where the rules
+        already live.
+        """
+        if config.tts_backend == "xtts":
+            from .xtts_backend import XTTS_LANGUAGES
+
+            return {
+                "active": config.language,
+                "options": sorted(XTTS_LANGUAGES),
+                "locked": False,
+                "reason": "XTTS is multilingual in one model — pick any language per request",
+            }
+        return {
+            "active": config.language,
+            "options": [config.language],
+            "locked": True,
+            "reason": (
+                f"F5 loads one language model per process; this one serves "
+                f"'{config.language}'. Restart with --language to change it."
+            ),
+        }
 
     @app.get("/samples", dependencies=[Depends(api_key_dep)])
     async def samples(request: Request, details: bool = False):
@@ -231,6 +294,21 @@ def create_app(
     @app.get("/health")
     async def health(request: Request):
         return _engine(request).health()
+
+    @app.get("/", include_in_schema=False)
+    async def ui():
+        """The built-in test page.
+
+        Deliberately NOT behind the API key: you have to be able to load the
+        page in order to type the key into it. Every call the page then makes
+        (/languages, /samples, /tts) is protected as usual.
+        """
+        if not UI_INDEX.exists():
+            return JSONResponse(
+                {"detail": "web UI not installed (src/static/index.html missing)"},
+                status_code=404,
+            )
+        return FileResponse(UI_INDEX, media_type="text/html")
 
     @app.post("/shutdown", dependencies=[Depends(api_key_dep)])
     async def shutdown(request: Request):
