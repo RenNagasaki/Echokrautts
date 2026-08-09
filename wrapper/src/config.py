@@ -144,7 +144,15 @@ class Config:
     voicepack_auto_download: bool = True
     voicepack_repo: str = "RenNagasaki/Echokraut"
     voicepack_tag_prefix: str = "EK-VoicePack-"
-    max_workers: Optional[int] = None
+    # Size of the worker pool. Each worker is a full model copy on the device,
+    # and a single request is always served by exactly ONE of them — more
+    # workers buy concurrency, never speed. Default 1: the common case is a game
+    # client asking for one line at a time, and the VRAM saved is better spent
+    # on a larger model or fp16 headroom. Raise it when several requests really
+    # do arrive at once; free VRAM then caps the actual count below this number.
+    # ``null`` restores the old behaviour: derive the count from free VRAM, at
+    # most 4.
+    max_workers: Optional[int] = 1
     vram_reserve_gb: float = 1.5
     per_job_gb: float = 3.0
     max_queue: int = 64

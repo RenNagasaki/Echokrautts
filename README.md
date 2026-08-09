@@ -112,7 +112,7 @@ no separate Docker configuration schema. The ones that actually matter in a cont
 | `F5W_LANGUAGE` | `de` | F5: which finetune is loaded at startup. XTTS: the fallback when a request omits `language`. |
 | `F5W_XTTS_FP16` | unset (`false`) | XTTS half precision, ~1.4× faster. CUDA only — silently ignored on CPU. |
 | `F5W_API_KEY` | unset | Requires `Authorization: Bearer <key>` on every endpoint. **Set it if the port is reachable from anywhere but the host** — the server binds `0.0.0.0`. |
-| `F5W_MAX_WORKERS` | unset (cap 4) | **Upper cap**, not a fixed count: the pool size is derived from free VRAM at startup (`(free − F5W_VRAM_RESERVE_GB) ÷ F5W_PER_JOB_GB`) and then capped by this. Set `1` to force a single worker — sensible on CPU or a small GPU. |
+| `F5W_MAX_WORKERS` | `1` | Worker-pool ceiling. Each worker is a full model copy on the device, and one request is served by exactly one worker — more workers buy **concurrency, not speed**. Raise it only if several requests really arrive at once; free VRAM (`(free − reserve) ÷ per_job`) may still cap the count lower. `null` = derive it from VRAM, at most 4. |
 | `F5W_VOICEPACK_AUTO_DOWNLOAD` | `true` | Fetch the Echokraut voice pack when the samples volume is empty. Set `false` if you only ever use your own voices. |
 | `F5W_RATE_LIMIT_PER_HOUR` · `F5W_RATE_LIMIT_PER_IP_PER_HOUR` | `0` (off) | Sliding-window request limits on `/tts` → 429 + `Retry-After`. Worth setting whenever the port is reachable beyond the host; see [Rate limits](#rate-limits). |
 | `F5W_TRUST_FORWARDED_FOR` | `false` | Take the caller address from `X-Forwarded-For`. Only behind a proxy you control — a container behind one otherwise counts every caller as the proxy. |
@@ -227,6 +227,13 @@ The bootstrap **detects your hardware** (the "detect GPU" step) and installs the
   pool on CPU if it fails, so you always get working audio, just not always on the GPU.
 - The **`xtts_fp16`** speedup applies only where the device is CUDA (NVIDIA or ROCm); see
   [TTS backends](#tts-backends).
+- **Workers are concurrency, not speed.** A worker is one model instance loaded on the device, and a
+  request occupies exactly one for its whole duration — so a second worker never makes a single line
+  faster, it lets a *second* line be synthesised at the same time. Each one costs a full copy of the
+  weights in VRAM, which is why the default is **`max_workers: 1`**: raise it when several requests
+  genuinely arrive at once, and free VRAM still caps the real count below your number
+  (`(free − vram_reserve_gb) ÷ per_job_gb`; `null` = derive it automatically, at most 4). When every
+  worker is busy the request queues, and only past `max_queue` does it become a 503.
 - Detection can be overruled with **`gpu_backend`** (`auto` · `cuda` · `rocm` · `rocm_win` · `dml` ·
   `xpu` · `cpu`).
   Use it where probing cannot see the truth — inside containers, or to force CPU deliberately. An

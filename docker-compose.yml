@@ -26,6 +26,10 @@ services:
       F5W_LANGUAGE: "${F5W_LANGUAGE:-de}"
       # Half precision — only takes effect on CUDA, ~1.4x faster on XTTS.
       F5W_XTTS_FP16: "${F5W_XTTS_FP16:-true}"
+      # One worker by default: a worker is a full model copy in VRAM and one
+      # request uses exactly one, so more workers add concurrency, not speed.
+      # Raise this only if several requests really arrive at once.
+      F5W_MAX_WORKERS: "${F5W_MAX_WORKERS:-1}"
       # Uncomment to require `Authorization: Bearer <key>` on every request.
       # The container listens on 0.0.0.0 — set this if the port is reachable
       # from outside the host.

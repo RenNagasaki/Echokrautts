@@ -221,3 +221,39 @@ def test_forced_rocm_win_carries_the_wheel_config(monkeypatch, cfg):
     det = gpu_detect.detect_backend(cfg)
     assert det.backend == "rocm_win"
     assert det.torch_wheel_urls and det.python_version == "3.12"
+
+
+# ------------------------------------------------------- worker pool default
+def test_default_is_a_single_worker_even_on_a_big_gpu(monkeypatch):
+    # A request is served by exactly one worker, so extra workers only buy
+    # concurrency — the default must not silently spend VRAM on it.
+    cfg = Config()  # untouched defaults
+    assert cfg.max_workers == 1
+    monkeypatch.setattr(
+        gpu_detect,
+        "_nvidia_query",
+        lambda field: ["12.0"] if field == "compute_cap" else ["32768"],  # 32 GB free
+    )
+    assert gpu_detect.detect_backend(cfg).max_workers_hint == 1
+
+
+def test_raising_max_workers_lets_vram_decide(monkeypatch):
+    cfg = Config(max_workers=8, vram_reserve_gb=1.5, per_job_gb=3.0)
+    monkeypatch.setattr(
+        gpu_detect,
+        "_nvidia_query",
+        lambda field: ["12.0"] if field == "compute_cap" else ["16384"],  # 16 GB free
+    )
+    # floor((16 - 1.5) / 3) = 4, below the ceiling of 8.
+    assert gpu_detect.detect_backend(cfg).max_workers_hint == 4
+
+
+def test_null_max_workers_restores_auto(monkeypatch):
+    cfg = Config(max_workers=None, vram_reserve_gb=1.5, per_job_gb=3.0)
+    monkeypatch.setattr(
+        gpu_detect,
+        "_nvidia_query",
+        lambda field: ["12.0"] if field == "compute_cap" else ["32768"],
+    )
+    # Auto is still capped at 4, not at the VRAM-derived 10.
+    assert gpu_detect.detect_backend(cfg).max_workers_hint == 4

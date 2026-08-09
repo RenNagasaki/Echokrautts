@@ -228,6 +228,8 @@ def _pci_vendor_present(vendor_hex: str, require_dgpu: bool = False) -> bool:
 # ------------------------------------------------------------------ assemble
 def _apply_worker_hint(det: Detection, config: Config) -> Detection:
     """Compute ``max_workers_hint`` from free VRAM (SPEC §4.5)."""
+    # ``max_workers`` is a ceiling, not a target: free VRAM may allow fewer.
+    # None means "auto" — the pre-1-default behaviour, capped at 4.
     cfg_max = config.max_workers if config.max_workers else 4
     if det.backend in ("dml", "xpu", "cpu"):
         det.max_workers_hint = 1

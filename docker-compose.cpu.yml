@@ -21,7 +21,8 @@ services:
       F5W_LANGUAGE: "${F5W_LANGUAGE:-de}"
       # fp16 is CUDA-only; the wrapper ignores it on CPU (see /health).
       F5W_XTTS_FP16: "false"
-      # One worker: CPU inference is memory-hungry and gains nothing from a pool.
+      # One worker is the default anyway; spelled out here because on CPU a pool
+      # is pure memory cost — inference is slow enough that requests queue.
       F5W_MAX_WORKERS: "1"
       # F5W_API_KEY: "change-me"
     volumes:

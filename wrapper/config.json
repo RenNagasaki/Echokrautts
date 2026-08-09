@@ -35,7 +35,7 @@
   "voicepack_repo": "RenNagasaki/Echokraut",
   "voicepack_tag_prefix": "EK-VoicePack-",
   "models_dir": "models",
-  "max_workers": null,
+  "max_workers": 1,
   "vram_reserve_gb": 1.5,
   "per_job_gb": 3.0,
   "max_queue": 64,
