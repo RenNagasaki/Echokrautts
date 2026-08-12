@@ -55,27 +55,50 @@ class TtsRequest(BaseModel):
     format: str = "pcm"
 
 
+# Display names of the backends for user-facing messages.
+BACKEND_NAMES = {"f5": "F5-TTS", "xtts": "XTTS", "chatterbox": "Chatterbox"}
+
+
+def _request_languages(config: Config) -> Optional[frozenset]:
+    """Languages the ACTIVE backend accepts per request, or ``None`` when it is
+    locked to the model loaded at startup.
+
+    XTTS and Chatterbox are each multilingual in ONE model, so a per-request
+    language just selects the target — no reload, no cost. F5 loads one finetune
+    per process and can only voice that language. Both imports are lazy so this
+    module stays importable without either engine installed.
+    """
+    if config.tts_backend == "xtts":
+        from .xtts_backend import XTTS_LANGUAGES
+
+        return XTTS_LANGUAGES
+    if config.tts_backend == "chatterbox":
+        from .chatterbox_backend import CHATTERBOX_LANGUAGES
+
+        return CHATTERBOX_LANGUAGES
+    return None
+
+
 def _resolve_language(config: Config, requested: Optional[str]) -> str:
     """Pick the effective synthesis language, backend-aware (SPEC §5).
 
-    XTTS is natively multilingual in one model → any language it supports is
-    accepted per request (no reload); an unsupported code is a clean 400 rather
-    than a deep 500 from inside XTTS. F5 loads one finetune per process, so it
-    can only voice its loaded language → a per-request ``language`` is ignored
-    (the loaded model is used regardless), never rejected. Omitting ``language``
-    always falls back to the wrapper's active/startup language.
+    For a multilingual backend an unsupported code is a clean 400 rather than a
+    deep 500 from inside the engine. For a locked one (F5) a per-request
+    ``language`` is ignored — the loaded model is used regardless — never
+    rejected. Omitting ``language`` always falls back to the active/startup
+    language.
     """
-    if config.tts_backend == "xtts" and requested:
-        from .xtts_backend import XTTS_LANGUAGES
-
-        if requested not in XTTS_LANGUAGES:
+    options = _request_languages(config)
+    if options is not None and requested:
+        if requested not in options:
+            name = BACKEND_NAMES.get(config.tts_backend, config.tts_backend)
             raise HTTPException(
                 status_code=400,
-                detail=f"language '{requested}' is not supported by XTTS "
-                f"(supported: {', '.join(sorted(XTTS_LANGUAGES))})",
+                detail=f"language '{requested}' is not supported by {name} "
+                f"(supported: {', '.join(sorted(options))})",
             )
         return requested
-    # F5 (or XTTS without a request language): use the loaded/startup language.
+    # Locked backend, or no request language: use the loaded/startup language.
     return config.language
 
 
@@ -273,14 +296,14 @@ def create_app(
         teaching the page the backend rules — better answered where the rules
         already live.
         """
-        if config.tts_backend == "xtts":
-            from .xtts_backend import XTTS_LANGUAGES
-
+        options = _request_languages(config)
+        if options is not None:
+            name = BACKEND_NAMES.get(config.tts_backend, config.tts_backend)
             return {
                 "active": config.language,
-                "options": sorted(XTTS_LANGUAGES),
+                "options": sorted(options),
                 "locked": False,
-                "reason": "XTTS is multilingual in one model — pick any language per request",
+                "reason": f"{name} is multilingual in one model — pick any language per request",
             }
         return {
             "active": config.language,

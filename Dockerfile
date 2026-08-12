@@ -11,10 +11,11 @@
 #  nvidia-container-toolkit. Saves ~2 GB and keeps both variants identical
 #  apart from one index URL.
 #
-#  Model weights are NOT baked in. They are non-commercial (F5 finetunes
-#  CC-BY-NC-4.0, XTTS-v2 CPML) — redistributing them inside a public image
-#  would be a licensing problem. The entrypoint downloads them on first start
-#  into the /data/models volume instead.
+#  Model weights are NOT baked in. Two of the three engines ship non-commercial
+#  weights (F5 finetunes CC-BY-NC-4.0, XTTS-v2 CPML) — redistributing them
+#  inside a public image would be a licensing problem, and Chatterbox's are
+#  simply large. The entrypoint downloads the ACTIVE backend's weights on first
+#  start into the /data/models volume instead.
 # ============================================================================
 
 ARG PYTHON_VERSION=3.11
@@ -28,6 +29,13 @@ ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 ARG TORCH_VERSION=2.7.0
 ARG TORCHAUDIO_VERSION=2.7.0
 ARG TRANSFORMERS_CONSTRAINT=transformers>=4.57,<5
+# Chatterbox is installed --no-deps + a curated list, because its own metadata
+# pins torch==2.6.0, transformers==5.2.0 and gradio — see config.chatterbox_install
+# (keep both in sync). setuptools<81 is NOT in this list: it carries a `<`, which
+# an unquoted shell expansion below would read as a redirect, so it is installed
+# as its own quoted argument.
+ARG CHATTERBOX_PACKAGE=chatterbox-tts==0.1.7
+ARG CHATTERBOX_DEPS="s3tokenizer diffusers==0.29.0 conformer==0.3.2 resemble-perth pyloudnorm pykakasi omegaconf einops"
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -49,13 +57,18 @@ COPY wrapper/src /src/wrapper/src
 #   2. BOTH engines in a SINGLE resolution (f5-tts via the wrapper project +
 #      coqui-tts) with the transformers pin in the same resolve, so pip finds
 #      one mutually compatible set instead of two installs stomping each other
-#   3. re-pin torch — the engine deps can win the resolution and drag in a
+#   3. Chatterbox with --no-deps + its curated deps (its pins are unresolvable
+#      against 2. — torch 2.6, transformers 5.2, gradio), carrying the
+#      transformers pin so a dep cannot drag it to 5.x
+#   4. re-pin torch — the engine deps can win the resolution and drag in a
 #      newer torch that requires torchcodec (→ system FFmpeg)
-#   4. drop the unused torchcodec (f5-tts declares it but only calls
+#   5. drop the unused torchcodec (f5-tts declares it but only calls
 #      torchaudio.load, which uses the bundled soundfile backend on 2.7.x)
 RUN pip install "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" \
         --index-url "${TORCH_INDEX_URL}" \
  && pip install /src/wrapper coqui-tts "${TRANSFORMERS_CONSTRAINT}" \
+ && pip install --no-deps "${CHATTERBOX_PACKAGE}" \
+ && pip install ${CHATTERBOX_DEPS} "setuptools<81" "${TRANSFORMERS_CONSTRAINT}" \
  && pip install "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" \
         --index-url "${TORCH_INDEX_URL}" \
  && pip uninstall -y torchcodec || true
@@ -71,7 +84,14 @@ if base != want:
 if u.find_spec("torchcodec") is not None:
     sys.exit("torch verification failed: torchcodec is present (would require system FFmpeg)")
 from transformers.pytorch_utils import isin_mps_friendly  # noqa: F401 — XTTS needs it (gone in transformers 5.x)
-print(f"ok: torch {torch.__version__}, no torchcodec, transformers pin holds")
+import perth
+from chatterbox.mtl_tts import ChatterboxMultilingualTTS  # noqa: F401 — must import on our transformers pin
+if perth.PerthImplicitWatermarker is None:
+    # perth swallows the ImportError and degrades the class to None; the model
+    # constructor then dies with "'NoneType' object is not callable". Usually
+    # means pkg_resources is gone, i.e. setuptools >= 81.
+    sys.exit("chatterbox verification failed: perth watermarker unavailable")
+print(f"ok: torch {torch.__version__}, no torchcodec, transformers pin holds, chatterbox loads")
 PY
 
 # ------------------------------------------------------------------ runtime
@@ -91,7 +111,7 @@ ARG VARIANT=cuda
 ARG GPU_BACKEND=auto
 
 LABEL org.opencontainers.image.title="Echokrautts" \
-      org.opencontainers.image.description="Streaming voice-cloning TTS wrapper (F5-TTS + XTTS-v2) with an HTTP API" \
+      org.opencontainers.image.description="Streaming voice-cloning TTS wrapper (F5-TTS + XTTS-v2 + Chatterbox Multilingual) with an HTTP API" \
       org.opencontainers.image.source="https://github.com/RenNagasaki/Echokrautts" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${ECHOKRAUTTS_VERSION}"

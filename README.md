@@ -1,7 +1,8 @@
 # Echokrautts
 
-A lightweight, plug-and-play Python wrapper around two **voice-cloning TTS** engines —
-[F5-TTS](https://github.com/SWivid/F5-TTS) and [XTTS-v2](https://huggingface.co/coqui/XTTS-v2) —
+A lightweight, plug-and-play Python wrapper around three **voice-cloning TTS** engines —
+[F5-TTS](https://github.com/SWivid/F5-TTS), [XTTS-v2](https://huggingface.co/coqui/XTTS-v2) and
+[Chatterbox Multilingual](https://github.com/resemble-ai/chatterbox) —
 that a host application (e.g. a C#/Dalamud plugin) starts as a **separate process** and drives
 over stdout (NDJSON events) and HTTP (streaming PCM). It provides zero-shot voice cloning with
 sentence-level streaming, a VRAM-aware worker pool, and self-contained installation via
@@ -16,14 +17,16 @@ The simplest entry point is the one-click launcher in the repo root — it fetch
 everything on first run, then serves. There is one launcher pair per TTS backend:
 
 ```bash
-start-f5tts.bat      # Windows, F5-TTS backend (visible window, pauses at the end)
-./start-f5tts.sh     # Linux/macOS, F5-TTS backend
-start-xtts.bat       # Windows, XTTS-v2 backend
-./start-xtts.sh      # Linux/macOS, XTTS-v2 backend
+start-f5tts.bat        # Windows, F5-TTS backend (visible window, pauses at the end)
+./start-f5tts.sh       # Linux/macOS, F5-TTS backend
+start-xtts.bat         # Windows, XTTS-v2 backend
+./start-xtts.sh        # Linux/macOS, XTTS-v2 backend
+start-chatterbox.bat   # Windows, Chatterbox Multilingual backend
+./start-chatterbox.sh  # Linux/macOS, Chatterbox Multilingual backend
 ```
 
-Both engines and all their weights are installed either way; the launcher only picks (via
-`--tts-backend f5` / `--tts-backend xtts`) which engine the worker pool loads at startup, so
+All engines and all their weights are installed either way; the launcher only picks (via
+`--tts-backend f5` / `xtts` / `chatterbox`) which engine the worker pool loads at startup, so
 switching is a restart, not a reinstall. All launchers forward extra arguments, e.g.
 `start-xtts.bat --language en`.
 
@@ -36,7 +39,7 @@ python wrapper/bootstrap/bootstrap.py --start --parent-pid <host_pid>
 
 The bootstrap runs a fixed 6-step sequence (obtain `uv` → pin Python → detect GPU → install deps →
 preload models → serve) and reports each step as an NDJSON `progress` event on stdout. When the
-server is listening it emits a `ready` event with host/port/backend. **Both TTS engines and all of
+server is listening it emits a `ready` event with host/port/backend. **All TTS engines and all of
 their model weights are installed once**, so switching engine or language is only a restart (see
 [TTS backends](#tts-backends)).
 
@@ -97,7 +100,7 @@ Pin a version with `ECHOKRAUTTS_TAG=0.0.0.6 docker compose up -d`.
 | Container path | What belongs there | If you skip it |
 | --- | --- | --- |
 | `/data/samples` | Your voice samples. Either `<name>.wav` (also `.flac`/`.mp3`) or a folder `<name>/` holding several clips of the same voice — one is picked at random per request. The request only uses the **stem**, so `X`, `X.wav` and `X.mp3` all resolve to the same voice. Empty on first start → the container fetches the [Echokraut voice pack](#voice-samples) into it. | The voice pack is re-downloaded on every `docker run` and lost with the container. |
-| `/data/models` | Model weights plus the HuggingFace and Coqui caches. Deliberately **not** baked into the image: the weights are non-commercially licensed (F5 finetunes CC-BY-NC-4.0, XTTS-v2 CPML), so the container fetches them on first start. | Works, but every `docker run` re-downloads several GB into the container's throwaway layer. |
+| `/data/models` | Model weights plus the HuggingFace and Coqui caches. Deliberately **not** baked into the image: two of the three engines ship non-commercially licensed weights (F5 finetunes CC-BY-NC-4.0, XTTS-v2 CPML), so the container fetches the active backend's weights on first start. | Works, but every `docker run` re-downloads several GB into the container's throwaway layer. |
 
 **Port.** The server listens on `8765` inside the container (`EXPOSE 8765`); publish it with
 `-p 8765:8765` or the compose `ports:` entry. Change the *inside* port with `F5W_PORT` only if you
@@ -108,8 +111,9 @@ no separate Docker configuration schema. The ones that actually matter in a cont
 
 | Variable | Image default | Meaning |
 | --- | --- | --- |
-| `F5W_TTS_BACKEND` | `xtts` | `xtts` = XTTS-v2, clones from the sample alone, multilingual per request. `f5` = F5-TTS, loads **one** language finetune per process and needs a transcript (or ASR) for the reference clip. |
-| `F5W_LANGUAGE` | `de` | F5: which finetune is loaded at startup. XTTS: the fallback when a request omits `language`. |
+| `F5W_TTS_BACKEND` | `xtts` | `xtts` = XTTS-v2, clones from the sample alone, multilingual per request. `f5` = F5-TTS, loads **one** language finetune per process and needs a transcript (or ASR) for the reference clip. `chatterbox` = Chatterbox Multilingual, clones from the sample alone, 23 languages per request, but **no streaming and no `speed`** (see [TTS backends](#tts-backends)). |
+| `F5W_LANGUAGE` | `de` | F5: which finetune is loaded at startup. XTTS/Chatterbox: the fallback when a request omits `language`. |
+| `F5W_CHATTERBOX_EXAGGERATION` · `F5W_CHATTERBOX_CFG_WEIGHT` · `F5W_CHATTERBOX_TEMPERATURE` | `0.5` · `0.5` · `0.8` | Chatterbox delivery: emotional intensity, guidance (lower = looser/faster) and sampling randomness. Ignored by the other engines. |
 | `F5W_XTTS_FP16` | unset (`false`) | XTTS half precision, ~1.4× faster. CUDA only — silently ignored on CPU. |
 | `F5W_API_KEY` | unset | Requires `Authorization: Bearer <key>` on every endpoint. **Set it if the port is reachable from anywhere but the host** — the server binds `0.0.0.0`. |
 | `F5W_MAX_WORKERS` | `1` | Worker-pool ceiling. Each worker is a full model copy on the device, and one request is served by exactly one worker — more workers buy **concurrency, not speed**. Raise it only if several requests really arrive at once; free VRAM (`(free − reserve) ÷ per_job`) may still cap the count lower. `null` = derive it from VRAM, at most 4. |
@@ -220,7 +224,7 @@ The bootstrap **detects your hardware** (the "detect GPU" step) and installs the
 | **Intel dGPU** | ⚠️ XPU detected, but XTTS maps it to CPU and F5 self-tests → typically **CPU** | ⚠️ same |
 | **No GPU / other** | 🐢 CPU | 🐢 CPU |
 
-- **Both backends run on any of these** — the question is only *how fast*. On CPU (incl. AMD-on-Windows
+- **Every backend runs on any of these** — the question is only *how fast*. On CPU (incl. AMD-on-Windows
   and Intel) expect real-time factor **> 1** (slower than real time): fine for testing, too slow for
   live in-game TTS.
 - For fragile devices (dml/xpu) the engine runs a tiny **self-test** at startup and rebuilds the worker
@@ -363,16 +367,51 @@ built-in ASR and cached. The `xtts` backend needs no transcript (it clones from 
 
 ## TTS backends
 
-The wrapper ships two interchangeable engines. A process loads **one** at startup, selected by
-`tts_backend` (config) or `--tts-backend <f5|xtts>` (default `f5`). `GET /health` reports the active
-backend. Both engines are installed by the bootstrap, so switching is only a restart.
+The wrapper ships three interchangeable engines. A process loads **one** at startup, selected by
+`tts_backend` (config) or `--tts-backend <f5|xtts|chatterbox>` (default `f5`). `GET /health` reports
+the active backend. All engines are installed by the bootstrap, so switching is only a restart.
 
 | Backend | Model | Reference transcript | Notes |
 |---------|-------|----------------------|-------|
 | `f5`   | F5-TTS finetunes (per language) | needed — from a sidecar `.txt`, the request's `ref_text`, or auto-transcribed via F5's built-in ASR | code MIT, weights CC-BY-NC |
 | `xtts` | Coqui XTTS-v2 (one multilingual model) | **not needed** — clones from the audio alone | code MPL-2.0, weights CPML (non-commercial) |
+| `chatterbox` | Resemble Chatterbox Multilingual (one model, 23 languages) | **not needed** — clones from the audio alone | code **and weights MIT** — the only commercially usable engine here |
 
-Both output mono `pcm_s16le` at 24000 Hz, so the HTTP contract is identical. `f5` emits one PCM
+### Chatterbox specifics
+
+Three things differ from the other two, and all three are visible from the outside:
+
+- **No streaming.** The released package has no incremental generation API, so a sentence is
+  synthesized whole, like `f5` (the `first=` and `parts=` fields in the request log show it: one
+  part, first audio at the end).
+- **No `speed`.** Its `generate()` has no speed parameter — a request's `speed` is ignored, and the
+  wrapper says so once in the log rather than pretending it worked.
+- **Every clip is watermarked.** The library runs its output through Resemble's `perth` implicit
+  watermarker — inaudible, part of the upstream path, left in place.
+
+**Speed.** Chatterbox is the slowest of the three: measured on an RTX 5090 (Windows), a German
+sentence runs at **rtf ≈ 0.95**, against ≈ 0.45 for XTTS with fp16. The reason is structural, not a
+missing setting — its token loop issues ~1100 CUDA kernels per token while the GPU only does ~5 ms of
+work per token, so the wall clock is dominated by kernel-submission latency, not by computation.
+Consequently **fp16 and TF32 change nothing** here (both measured), and `torch.compile` makes it
+*worse* in the real loop (rtf 15 — the growing KV cache defeats it) even though it doubles the speed
+of an isolated forward pass. If you need the lowest latency, use `xtts`; use `chatterbox` for its
+voice quality, its 23 languages or its MIT-licensed output.
+
+Its delivery is tuned by three config values (not request fields, so the HTTP contract stays
+backend-agnostic): `chatterbox_exaggeration` (emotional intensity, 0.5 = neutral),
+`chatterbox_cfg_weight` (guidance; lower = looser, faster delivery) and `chatterbox_temperature`.
+
+It is also the one engine that **cannot be resolved with the others**: `chatterbox-tts` pins
+`torch==2.6.0`, `transformers==5.2.0` and pulls in gradio, while this wrapper pins torch 2.7.0 and
+coqui-tts needs transformers <5. It is therefore installed with `--no-deps` plus a curated list of
+what it really imports (`chatterbox_install` in `wrapper/config.json` — a version bump is an edit
+there, no code change). The bootstrap asserts it can actually load before writing its install
+marker. One entry of that list is not obvious: **`setuptools<81`**, because the watermarker imports
+`pkg_resources`, which newer setuptools no longer ships — without it `perth` silently degrades and
+the model constructor dies with `'NoneType' object is not callable`.
+
+All three output mono `pcm_s16le` at 24000 Hz, so the HTTP contract is identical. `f5` emits one PCM
 block per sentence; `xtts` does **token streaming** (`inference_stream`), emitting many smaller PCM
 parts as they are generated for much lower first-audio latency (`stream_chunk_size` tunes the
 granularity, default 20). For extra XTTS throughput, set `xtts_fp16: true` to load the model in
@@ -386,10 +425,11 @@ unmaintained). See [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for the 
 
 Every request may carry a `language` field; how it is treated depends on the backend. `f5` serves
 **one language per process**, chosen at startup via `language` (config) or `--language <code>`, with
-each language mapping to a distinct model in the `languages` config block. `xtts` covers all
-languages with its **single multilingual model**, so the per-request `language` picks the target
-language on the fly — **no restart or reload**. Omitting `language` falls back to the startup
-language in both cases.
+each language mapping to a distinct model in the `languages` config block. `xtts` and `chatterbox`
+each cover all their languages with a **single multilingual model**, so the per-request `language`
+picks the target language on the fly — **no restart or reload**. Omitting `language` falls back to
+the startup language in every case. `GET /languages` answers this per backend (which is what the web
+UI uses to grey the selector out for `f5`).
 
 | Lang | F5 model | Source |
 |------|----------|--------|
@@ -404,7 +444,10 @@ switching the F5 language (or the backend) is just a restart with a different `-
 backend-aware: on `f5`, a per-request `language` is **ignored** — the loaded/startup model is always
 used (F5 can only voice its one finetune); on `xtts`, any of its supported codes
 (`en es fr de it pt pl tr ru nl cs ar zh-cn ja hu ko hi`) is accepted per request and an unsupported
-code returns `400`. Provide a **reference sample in the target language** (and, for `f5`, ideally a
+code returns `400`; on `chatterbox`, the same holds for its 23 codes
+(`ar da de el en es fi fr he hi it ja ko ms nl no pl pt ru sv sw tr zh`). **Mind the spelling of
+Chinese** — `zh-cn` for XTTS, `zh` for Chatterbox. Provide a **reference sample in the target
+language** (and, for `f5`, ideally a
 matching `.txt` transcript) for best results. To add/replace an F5 language, edit the `languages`
 map in `wrapper/config.json` (verify repo + file names against F5-TTS `SHARED.md`).
 
@@ -422,14 +465,17 @@ The unit suite mocks F5-TTS/torch, so it runs anywhere without GPU or multi-GB d
 ## Licensing
 
 - **Wrapper code: AGPL-3.0.**
-- **All speech-model weights are NON-COMMERCIAL** and are kept strictly separate from this AGPL
-  code: F5-TTS weights (base + finetunes) are **CC-BY-NC-4.0**, XTTS-v2 weights are under the
-  **Coqui Public Model License (CPML)**. They are *not* shipped in this repo — the bootstrap
-  downloads them at runtime into `wrapper/models/`. The synthesized audio (model *output*) inherits
-  these terms, so **you may not use it commercially** without a separate license from the rights
+- **The weights differ per engine, and two of the three are NON-COMMERCIAL.** They are kept strictly
+  separate from this AGPL code and are *not* shipped in this repo — the bootstrap downloads them at
+  runtime into `wrapper/models/`.
+  - F5-TTS weights (base + finetunes): **CC-BY-NC-4.0** — non-commercial.
+  - XTTS-v2 weights: **Coqui Public Model License (CPML)** — non-commercial.
+  - Chatterbox Multilingual weights: **MIT** — no non-commercial restriction.
+  The synthesized audio (model *output*) inherits the terms of whichever engine produced it, so with
+  `f5` or `xtts` **you may not use it commercially** without a separate license from the rights
   holder. Keep each model's license notice with any distribution and do not relicense the weights.
 - The installed Python packages carry their own (mostly permissive) licenses — f5-tts is **MIT**,
-  coqui-tts is **MPL-2.0**, the rest are BSD/MIT/Apache.
+  coqui-tts is **MPL-2.0**, chatterbox-tts is **MIT**, the rest are BSD/MIT/Apache.
 - See [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for the complete manifest of installed
   packages and models with their licenses, and [`licenses/`](licenses/) for vendored full-text
   licenses (currently the CPML, whose original host `coqui.ai` is offline).

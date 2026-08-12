@@ -82,7 +82,8 @@
     <div class="row" style="margin-top:1rem; align-items:flex-end">
       <label style="flex:0 0 7rem">
         <span>Speed</span>
-        <input id="speed" type="number" value="1.0" step="0.05" min="0.5" max="2.0">
+        <input id="speed" type="number" value="1.0" step="0.05" min="0.5" max="2.0"
+               title="F5 and XTTS only — Chatterbox has no speed control">
       </label>
       <label style="flex:1 1 12rem">
         <span>API key <em style="text-transform:none">(only if configured)</em></span>
@@ -137,6 +138,14 @@ async function loadMeta() {
     `${health.tts_backend.toUpperCase()} on ${health.device} (${health.backend})` +
     ` · ${health.workers} worker(s)` +
     (health.xtts_fp16 ? " · fp16" : "");
+
+  // Chatterbox has no speed parameter at all — the request field is accepted
+  // but ignored, so the control is disabled rather than quietly doing nothing.
+  const noSpeed = health.tts_backend === "chatterbox";
+  $("speed").disabled = noSpeed;
+  $("speed").title = noSpeed
+    ? "Chatterbox has no speed control — this value is ignored"
+    : "Playback speed passed to the engine";
 
   // The language selector is driven by /languages, which knows the backend
   // rule: F5 loads ONE model per process, so the field is locked there.

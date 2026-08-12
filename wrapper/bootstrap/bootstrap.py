@@ -328,6 +328,8 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
         index, step,
     )
 
+    _install_chatterbox(config, py, index, step)
+
     # The project deps (f5-tts, or coqui-tts for XTTS) can win the torch
     # resolution and pull a build that re-introduces the FFmpeg requirement via
     # `torchcodec` (unused — audio loads via torchaudio.load → soundfile on the
@@ -349,9 +351,76 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
     # broken venv behind the marker (SPEC §3 idempotency must not cache garbage).
     _verify_torch(py, config, expected_version=torch_version)
     _verify_transformers(py)
+    _verify_chatterbox(py, config)
 
     _mark_done(step)
     ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten installiert", done=True)
+
+
+def _install_chatterbox(config, py: str, index: int, step: str) -> None:
+    """Install the Chatterbox engine — the one that cannot join the resolution.
+
+    ``chatterbox-tts`` pins ``torch==2.6.0`` and ``transformers==5.2.0`` and
+    pulls in gradio: the first fights this wrapper's torch pin, the second is
+    exactly the 5.x that breaks XTTS at model-load, and the third is a web UI we
+    do not use. Its actual transformers usage is limited to long-stable APIs
+    (``LlamaModel``/``LlamaConfig``/``GPT2*``/``GenerationMixin``) — identical in
+    the release pinning 4.46 and the one pinning 5.2 — so it is installed with
+    ``--no-deps`` plus the curated package list from ``config.chatterbox_install``
+    (live-verified against torch 2.7.0+cu128 / transformers 4.57.6).
+
+    The dependency install carries the transformers pin along, so a curated dep
+    cannot quietly drag it to a 5.x — the torch re-pin that follows in
+    :func:`step_deps` repairs torch, but nothing would repair transformers.
+    torch is deliberately NOT named here: a bare ``torch==`` without the
+    backend's ``--index-url`` is how a CPU wheel from PyPI ends up overwriting a
+    CUDA/ROCm build, and the re-pin already covers that case with the right
+    index (and the right version — AMD's Windows build is not the configured
+    pin).
+    """
+    spec = config.chatterbox_install or {}
+    package = spec.get("package")
+    if not package:  # explicitly disabled by config → engine simply unavailable
+        return
+    ndjson.progress(index, TOTAL_STEPS, step, "Installiere Chatterbox …", percent=60)
+    _run_uv(["pip", "install", "--python", py, "--no-deps", str(package)], index, step)
+    deps = [str(d) for d in (spec.get("deps") or [])]
+    if deps:
+        _run_uv(
+            ["pip", "install", "--python", py, *deps, config.transformers_constraint],
+            index, step,
+        )
+
+
+def _verify_chatterbox(py: str, config) -> None:
+    """Assert the Chatterbox engine can actually load — before ``deps.done``.
+
+    Two failure modes this catches, both of which otherwise surface only when
+    somebody picks ``--tts-backend chatterbox``, long after the install "worked":
+
+    * a missing/renamed import (e.g. a chatterbox release that really does need
+      transformers 5.x);
+    * ``perth.PerthImplicitWatermarker is None``. The watermarker imports
+      ``pkg_resources``, which setuptools 81+ no longer ships; perth swallows
+      that ImportError and sets the class to ``None``, so the model constructor
+      dies with the useless "'NoneType' object is not callable". Hence the
+      ``setuptools<81`` entry in the curated deps — and this assertion.
+    """
+    if not (config.chatterbox_install or {}).get("package"):
+        return
+    code = (
+        "import perth;"
+        "from chatterbox.mtl_tts import ChatterboxMultilingualTTS;"
+        "assert perth.PerthImplicitWatermarker is not None, 'perth watermarker unavailable'"
+    )
+    proc = procutil.run([py, "-c", code])
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+        raise FatalError(
+            "chatterbox verification failed: " + " | ".join(tail) + ". "
+            "Check config.chatterbox_install (it installs --no-deps on purpose); "
+            "delete .venv and .state/deps.done and rerun."
+        )
 
 
 def _verify_torch(py: str, config, expected_version: str | None = None) -> None:
@@ -446,8 +515,9 @@ def step_model(config) -> None:
         ndjson.progress(index, TOTAL_STEPS, step, "Sprachmodelle vorhanden", skipped=True)
         return
     # Download the weights for ALL engines (chosen at start, not install):
-    #   F5   → every language's checkpoint (en/de/fr/ja), SPEC §14.3.
-    #   XTTS → the one multilingual XTTS-v2 model.
+    #   F5         → every language's checkpoint (en/de/fr/ja), SPEC §14.3.
+    #   XTTS       → the one multilingual XTTS-v2 model.
+    #   Chatterbox → the one multilingual Chatterbox model.
     env = _server_env(config)
     # Let the download sub-processes emit their per-file progress bars onto THIS
     # same "Step 5/6 · model" bar (src.progress.ModelProgress reads these).
@@ -457,10 +527,14 @@ def step_model(config) -> None:
     rc = _popen_forward([str(_venv_python()), "-m", "src.models"], env)
     if rc != 0:
         raise FatalError("F5-Modell-Download fehlgeschlagen (siehe stderr/Log)")
-    ndjson.progress(index, TOTAL_STEPS, step, "Lade XTTS-v2-Modell …", percent=60)
+    ndjson.progress(index, TOTAL_STEPS, step, "Lade XTTS-v2-Modell …", percent=50)
     rc = _popen_forward([str(_venv_python()), "-m", "src.xtts_backend"], env)
     if rc != 0:
         raise FatalError("XTTS-Modell-Download fehlgeschlagen (siehe stderr/Log)")
+    ndjson.progress(index, TOTAL_STEPS, step, "Lade Chatterbox-Modell …", percent=75)
+    rc = _popen_forward([str(_venv_python()), "-m", "src.chatterbox_backend"], env)
+    if rc != 0:
+        raise FatalError("Chatterbox-Modell-Download fehlgeschlagen (siehe stderr/Log)")
     # Voices, not weights — and deliberately NOT fatal: a failed voice pack means
     # "no voices yet", which the user can fix by dropping in a wav. It must never
     # keep an otherwise working install from starting, so a non-zero exit only

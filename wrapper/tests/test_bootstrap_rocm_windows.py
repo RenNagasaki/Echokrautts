@@ -42,6 +42,7 @@ def bootstrap(monkeypatch):
     monkeypatch.setattr(mod.procutil, "run", lambda *_a, **_k: None)
     monkeypatch.setattr(mod, "_verify_torch", lambda *_a, **_k: None)
     monkeypatch.setattr(mod, "_verify_transformers", lambda *_a: None)
+    monkeypatch.setattr(mod, "_verify_chatterbox", lambda *_a: None)
     monkeypatch.setattr(mod.ndjson, "progress", lambda *_a, **_k: None)
     mod._recorded_calls = calls
     return mod
@@ -102,6 +103,47 @@ def test_engines_are_still_one_resolution(bootstrap):
     ]
     assert len(engine_cmds) == 1
     assert config.transformers_constraint in engine_cmds[0]
+
+
+def _chatterbox_cmds(calls):
+    spec = Config().chatterbox_install
+    return [c for c in calls if spec["package"] in c or "s3tokenizer" in c]
+
+
+def test_chatterbox_is_installed_no_deps_and_never_re_pins_torch(bootstrap):
+    # Its metadata pins torch==2.6.0 / transformers==5.2.0 / gradio, none of
+    # which this venv can honor — hence --no-deps plus a curated list.
+    config = Config()
+    bootstrap.step_deps(config, _rocm_win_detection(config))
+    package_cmd, deps_cmd = _chatterbox_cmds(bootstrap._recorded_calls)
+
+    assert "--no-deps" in package_cmd
+    assert config.chatterbox_install["package"] in package_cmd
+    # The curated deps carry the transformers pin (nothing else would repair a
+    # 5.x), but never a bare torch== — that is how a PyPI CPU wheel overwrites a
+    # CUDA/ROCm build. The re-pin afterwards owns torch, with the right index.
+    assert config.transformers_constraint in deps_cmd
+    assert not any(a.startswith("torch") for a in deps_cmd)
+    assert "--index-url" not in deps_cmd
+
+
+def test_chatterbox_runs_before_the_torch_re_pin(bootstrap):
+    # Order matters: any torch drift its deps cause must still be undone by the
+    # re-pin, so the install cannot sit after it.
+    config = Config()
+    bootstrap.step_deps(config, _rocm_win_detection(config))
+    calls = bootstrap._recorded_calls
+    last_chatterbox = max(calls.index(c) for c in _chatterbox_cmds(calls))
+    last_torch = max(i for i, c in enumerate(calls) if any("/torch-" in a for a in c))
+    assert last_chatterbox < last_torch
+
+
+def test_chatterbox_install_can_be_switched_off(bootstrap):
+    # An empty package means "do not install this engine" — it must not produce
+    # a bare `uv pip install --no-deps` with no argument.
+    config = Config(chatterbox_install={})
+    bootstrap.step_deps(config, _rocm_win_detection(config))
+    assert not _chatterbox_cmds(bootstrap._recorded_calls)
 
 
 def test_index_based_backends_are_unchanged(bootstrap):
