@@ -266,6 +266,12 @@ longer exists.)
 ## Release-Asset bauen (`build-release-zip.py`, Repo-Root)
 - `python build-release-zip.py` schreibt **`wrapper/EchokrauTTS.zip`** (gitignored); Release danach
   von Hand auf GitHub anlegen und die Datei hochladen. `--list` zeigt nur, was hineinkäme.
+- **`build-release-zip.bat` im Repo-Root ist der Doppelklick-Weg** (Argumente werden durchgereicht, also
+  auch `build-release-zip.bat --list`). Sie sucht den Interpreter, statt `python` anzunehmen:
+  Test-venv → `py -3` → `python` → `uv run --no-project python`. Grund: auf Windows ist `python` häufig
+  nur der WindowsApps-Platzhalter, der den Store öffnet statt Python zu starten — ein Doppelklick-Skript
+  darf daran nicht scheitern. Das Bau-Skript selbst braucht nur die Standardbibliothek, jedes Python 3
+  genügt. Kein `.sh`-Gegenstück: unter Linux ist `python build-release-zip.py` der ganze Befehl.
 - **Layout ist Vorgabe des C#-Hosts, keine Wahl:** er lädt das Asset, entpackt es nach
   `<installRoot>/echokrautts` und startet dort `bootstrap/bootstrap.py`. Im Archiv liegt deshalb der
   INHALT von `wrapper/` in der Wurzel, ohne `wrapper/`-Präfix — verifiziert gegen das echte
