@@ -3,3 +3,10 @@
 # Windows with core.autocrlf=true.
 *.sh text eol=lf
 Dockerfile text eol=lf
+
+# Batch files must keep CRLF. cmd.exe tolerates LF in simple scripts but is
+# documented to mis-handle it around goto and multi-line ( ) blocks, which the
+# release builder uses — and these are double-clicked by users, where a parse
+# error looks like "the window flashed and nothing happened". The .sh rule
+# above exists for the mirror-image reason.
+*.bat text eol=crlf
