@@ -58,14 +58,20 @@ class Config:
     # declares no transformers bound, so it accepts this too. Passed verbatim to
     # `uv pip install` in step_deps and asserted by `_verify_transformers`.
     transformers_constraint: str = "transformers>=4.57,<5"
+    # f5-tts pulls in `datasets`, which is otherwise unconstrained. Versions
+    # before 2.16 subclass `pyarrow.PyExtensionType`, which pyarrow REMOVED, so
+    # such a resolution installs cleanly and then dies on the first `import
+    # f5_tts.api` with "module 'pyarrow' has no attribute 'PyExtensionType'" —
+    # from deep inside a traceback that names neither package as the culprit.
+    # The floor keeps the resolver in the era where `pa.ExtensionType` is used
+    # (and where datasets declares a pyarrow floor of its own, so the two can no
+    # longer drift apart). Passed verbatim to `uv pip install` in step_deps.
+    datasets_constraint: str = "datasets>=3.0"
     # TTS backend engine the worker pool loads at startup (one per process):
     #   "f5"         → F5-TTS finetunes (needs a ref-text per sample; CC-BY-NC)
     #   "xtts"       → Coqui XTTS-v2 (clones from audio only, no ref-text; CPML)
-    #   "chatterbox" → Resemble Chatterbox Multilingual (audio-only clone, 23
-    #                  languages, MIT code + weights; no streaming, no speed)
-    # The bootstrap installs ALL engines + all their models, so switching is a
-    # restart with a different --tts-backend (no reinstall). See xtts_backend.py
-    # and chatterbox_backend.py.
+    # The bootstrap installs BOTH engines + all their models, so switching is a
+    # restart with a different --tts-backend (no reinstall). See xtts_backend.py.
     tts_backend: str = "f5"
     # Active language at startup; selects which model the worker pool loads.
     # The per-request ``language`` field must match this (or be omitted).
@@ -179,44 +185,6 @@ class Config:
     # (covers NVIDIA and ROCm; ignored on CPU/dml/xpu, where fp16 is unsupported
     # or slower). F5 ignores this. Experimental — verify audio quality per voice.
     xtts_fp16: bool = False
-    # Chatterbox generation knobs (its own defaults). Kept in config rather than
-    # in the request body so the HTTP contract stays backend-agnostic — the
-    # other two engines have no equivalent of any of them.
-    #   exaggeration → emotional intensity of the cloned voice (0.5 = neutral)
-    #   cfg_weight   → classifier-free guidance; lower = looser/faster delivery
-    #   temperature  → sampling randomness of the token model
-    # Ignored by F5 and XTTS.
-    chatterbox_exaggeration: float = 0.5
-    chatterbox_cfg_weight: float = 0.5
-    chatterbox_temperature: float = 0.8
-    # How the chatterbox backend is installed (data, not code — a version bump
-    # is an edit here). It is the ONE engine that cannot be resolved normally:
-    # `chatterbox-tts` pins `torch==2.6.0`, `transformers==5.2.0` and pulls
-    # gradio, while this wrapper pins torch 2.7.0 and coqui-tts needs
-    # transformers <5. So it goes in with `--no-deps` plus the packages it really
-    # imports. Two entries are not obvious:
-    #   * setuptools<81 — `resemble-perth` (the watermarker) imports
-    #     `pkg_resources`, which setuptools 81+ no longer ships. Without it the
-    #     package silently degrades `PerthImplicitWatermarker` to None and the
-    #     model constructor dies with "'NoneType' object is not callable".
-    #   * spacy-pkuseg is omitted on purpose (Chinese word segmentation only; it
-    #     warns and continues). Add it here if you need `zh`.
-    chatterbox_install: dict = field(
-        default_factory=lambda: {
-            "package": "chatterbox-tts==0.1.7",
-            "deps": [
-                "s3tokenizer",
-                "diffusers==0.29.0",
-                "conformer==0.3.2",
-                "resemble-perth",
-                "pyloudnorm",
-                "pykakasi",
-                "omegaconf",
-                "einops",
-                "setuptools<81",
-            ],
-        }
-    )
     asr_for_missing_ref_text: bool = True
     allowed_sample_ext: list[str] = field(
         default_factory=lambda: [".wav", ".flac", ".mp3"]
@@ -277,13 +245,7 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
         "rate_limit_per_ip_per_hour",
     ):
         return int(raw)
-    if name in (
-        "vram_reserve_gb",
-        "per_job_gb",
-        "chatterbox_exaggeration",
-        "chatterbox_cfg_weight",
-        "chatterbox_temperature",
-    ):
+    if name in ("vram_reserve_gb", "per_job_gb"):
         return float(raw)
     if name in (
         "asr_for_missing_ref_text",
@@ -299,7 +261,7 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
         raise ValueError(f"invalid bool for {name}: {raw!r}")
     if name == "allowed_sample_ext":
         return [s.strip() for s in raw.split(",") if s.strip()]
-    if name in ("languages", "rocm_windows", "chatterbox_install"):
+    if name in ("languages", "rocm_windows"):
         return json.loads(raw)
     if name in ("api_key", "hf_endpoint", "torch_index_override"):
         return None if raw == "" or raw.lower() == "null" else raw

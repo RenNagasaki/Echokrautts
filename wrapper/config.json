@@ -44,23 +44,7 @@
   "trust_forwarded_for": false,
   "max_chars_per_chunk": 250,
   "xtts_fp16": false,
-  "chatterbox_exaggeration": 0.5,
-  "chatterbox_cfg_weight": 0.5,
-  "chatterbox_temperature": 0.8,
-  "chatterbox_install": {
-    "package": "chatterbox-tts==0.1.7",
-    "deps": [
-      "s3tokenizer",
-      "diffusers==0.29.0",
-      "conformer==0.3.2",
-      "resemble-perth",
-      "pyloudnorm",
-      "pykakasi",
-      "omegaconf",
-      "einops",
-      "setuptools<81"
-    ]
-  },
+  "datasets_constraint": "datasets>=3.0",
   "asr_for_missing_ref_text": true,
   "allowed_sample_ext": [".wav", ".flac", ".mp3"],
   "hf_endpoint": null,

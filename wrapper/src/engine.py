@@ -155,14 +155,6 @@ def _default_factory(config: Config) -> WorkerFactory:
 
         return make_xtts
 
-    if config.tts_backend == "chatterbox":
-        def make_chatterbox(worker_id: int, device: str) -> WorkerProtocol:
-            from .chatterbox_backend import ChatterboxWorker  # lazy: chatterbox/torch
-
-            return ChatterboxWorker(config, device)
-
-        return make_chatterbox
-
     def make(worker_id: int, device: str) -> WorkerProtocol:
         return F5TTSWorker(config, device)
 

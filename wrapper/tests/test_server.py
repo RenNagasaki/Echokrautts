@@ -76,32 +76,6 @@ def test_tts_xtts_unsupported_language_rejected(config):
         assert "not supported" in r.json()["detail"]
 
 
-def test_tts_chatterbox_accepts_per_request_language(config):
-    # Chatterbox is multilingual in one model, like XTTS → the request language
-    # is honored verbatim, no reload.
-    config.tts_backend = "chatterbox"
-    engine = make_engine(config)
-    app = create_app(config=config, engine=engine)
-    with TestClient(app) as c:
-        r = c.post("/tts", json={"sample": "anna_de.wav", "text": "Hello.", "language": "en"})
-        assert r.status_code == 200
-    assert engine._workers[0].languages == ["en"]
-
-
-def test_tts_chatterbox_rejects_xtts_only_language_code(config):
-    # Chatterbox spells Chinese "zh", XTTS spells it "zh-cn". A code that is
-    # valid for the other backend must produce a clean 400 naming this one, not
-    # a 500 from inside the engine.
-    config.tts_backend = "chatterbox"
-    app = create_app(config=config, engine=make_engine(config))
-    with TestClient(app) as c:
-        r = c.post("/tts", json={"sample": "anna_de.wav", "text": "x", "language": "zh-cn"})
-        assert r.status_code == 400
-        assert "Chatterbox" in r.json()["detail"]
-        r = c.post("/tts", json={"sample": "anna_de.wav", "text": "x", "language": "zh"})
-        assert r.status_code == 200
-
-
 def test_samples_list(client):
     r = client.get("/samples")
     assert r.status_code == 200
@@ -227,17 +201,6 @@ def test_languages_open_for_xtts(config):
     assert body["active"] == "de"
     assert "en" in body["options"] and "ja" in body["options"]
     assert body["options"] == sorted(body["options"])
-
-
-def test_languages_open_for_chatterbox(config):
-    config.tts_backend = "chatterbox"
-    app = create_app(config=config, engine=make_engine(config))
-    with TestClient(app) as c:
-        body = c.get("/languages").json()
-    assert body["locked"] is False
-    assert body["active"] == "de"
-    assert len(body["options"]) == 23
-    assert "Chatterbox" in body["reason"]
 
 
 def test_ui_is_served_and_needs_no_api_key(config):

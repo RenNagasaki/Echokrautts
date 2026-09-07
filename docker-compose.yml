@@ -21,9 +21,7 @@ services:
     environment:
       # Engine choice is a restart, never a reinstall — both engines are in the
       # image. "xtts" clones from audio alone (no transcript) and is
-      # multilingual per request; "f5" loads ONE language finetune per process;
-      # "chatterbox" also clones from audio alone, covers 23 languages per
-      # request, but has no streaming and no speed control.
+      # multilingual per request; "f5" loads ONE language finetune per process.
       F5W_TTS_BACKEND: "${F5W_TTS_BACKEND:-xtts}"
       F5W_LANGUAGE: "${F5W_LANGUAGE:-de}"
       # Half precision — only takes effect on CUDA, ~1.4x faster on XTTS.

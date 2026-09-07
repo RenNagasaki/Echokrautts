@@ -52,23 +52,6 @@ def test_default_factory_selects_xtts(monkeypatch):
     assert made["device"] == "cpu"
 
 
-def test_default_factory_selects_chatterbox(monkeypatch):
-    from src import chatterbox_backend
-
-    made = {}
-
-    class FakeChatterbox:
-        def __init__(self, config, device):
-            made["config"] = config
-            made["device"] = device
-
-    monkeypatch.setattr(chatterbox_backend, "ChatterboxWorker", FakeChatterbox)
-    factory = _default_factory(Config(tts_backend="chatterbox"))
-    worker = factory(0, "cpu")
-    assert isinstance(worker, FakeChatterbox)
-    assert made["device"] == "cpu"
-
-
 def test_float_to_pcm16_known_values():
     wav = np.array([0.0, 1.0, -1.0, 2.0, -2.0], dtype=np.float32)
     pcm = float_to_pcm16(wav)

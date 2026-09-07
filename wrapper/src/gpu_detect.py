@@ -29,6 +29,13 @@ TORCH_INDEX = {
     "dml": "https://download.pytorch.org/whl/cpu",
 }
 
+# `torch-directml` hard-pins these and has not shipped since 2024-09-14 (a dev
+# release); Microsoft has DirectML in maintenance mode. So this is not a pin we
+# chose, it is the only version that exists — and the whole venv has to follow
+# it, since one venv cannot hold two torches.
+DML_TORCH_VERSION = "2.4.1"
+DML_TORCHAUDIO_VERSION = "2.4.1"
+
 
 @dataclass
 class Detection:
@@ -47,6 +54,7 @@ class Detection:
     torch_wheel_urls: list[str] = field(default_factory=list)
     python_version: str | None = None
     torch_version: str | None = None
+    torchaudio_version: str | None = None
 
 
 # --------------------------------------------------------------------- probes
@@ -161,13 +169,23 @@ def _detect_amd(config: Config) -> Detection | None:
         # Not on AMD's Windows-ROCm list → DirectML, as before. DirectML is in
         # maintenance mode upstream and its op coverage does not carry these
         # models, so the engine self-tests it and falls back to CPU (SPEC §4.2).
+        #
+        # The venv is pinned to DML_TORCH_VERSION rather than the configured
+        # torch, because `torch-directml` declares `torch==<that>` and nothing
+        # newer exists: installed into a 2.7 venv it silently downgraded torch,
+        # and `_verify_torch` then failed the install every single time — every
+        # released version, on every AMD/Windows machine (reported live). One
+        # torch for the whole venv is the only shape where the extra and the
+        # verification can both be right.
         return Detection(
             backend="dml",
             device="dml",
             torch_index_url=TORCH_INDEX["dml"],
             extra_packages=["torch-directml"],
             max_workers_hint=1,
-            detail="AMD on Windows → DirectML",
+            torch_version=DML_TORCH_VERSION,
+            torchaudio_version=DML_TORCHAUDIO_VERSION,
+            detail=f"AMD on Windows → DirectML (torch {DML_TORCH_VERSION})",
         )
     # Linux ROCm: HIP masquerades as a CUDA device.
     return Detection(

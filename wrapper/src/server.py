@@ -56,26 +56,26 @@ class TtsRequest(BaseModel):
 
 
 # Display names of the backends for user-facing messages.
-BACKEND_NAMES = {"f5": "F5-TTS", "xtts": "XTTS", "chatterbox": "Chatterbox"}
+BACKEND_NAMES = {"f5": "F5-TTS", "xtts": "XTTS"}
 
 
 def _request_languages(config: Config) -> Optional[frozenset]:
     """Languages the ACTIVE backend accepts per request, or ``None`` when it is
     locked to the model loaded at startup.
 
-    XTTS and Chatterbox are each multilingual in ONE model, so a per-request
-    language just selects the target — no reload, no cost. F5 loads one finetune
-    per process and can only voice that language. Both imports are lazy so this
-    module stays importable without either engine installed.
+    XTTS is multilingual in ONE model, so a per-request language just selects
+    the target — no reload, no cost. F5 loads one finetune per process and can
+    only voice that language. The import is lazy so this module stays importable
+    without the engine installed.
+
+    Deliberately a lookup and not an ``if`` chain per backend: a further
+    multilingual engine is one entry here, not a second branch in
+    ``_resolve_language`` and ``/languages`` as well.
     """
     if config.tts_backend == "xtts":
         from .xtts_backend import XTTS_LANGUAGES
 
         return XTTS_LANGUAGES
-    if config.tts_backend == "chatterbox":
-        from .chatterbox_backend import CHATTERBOX_LANGUAGES
-
-        return CHATTERBOX_LANGUAGES
     return None
 
 

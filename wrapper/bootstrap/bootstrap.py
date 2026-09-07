@@ -142,6 +142,28 @@ def _is_done(name: str) -> bool:
     return _marker(name).exists()
 
 
+def _clear_done(name: str) -> None:
+    _marker(name).unlink(missing_ok=True)
+
+
+def _existing_venv_problem(config, torch_version: str) -> str | None:
+    """Why the already-installed venv cannot be used, or None if it is fine.
+
+    Never raises: every failure mode here means "reinstall", so a surprise from
+    the probe itself must not abort the bootstrap that would have repaired it.
+    """
+    py = _venv_python()
+    if not py.exists():
+        return "venv fehlt"
+    try:
+        _verify_venv(str(py), config, torch_version)
+    except FatalError as exc:
+        return str(exc).split(".")[0]
+    except OSError as exc:  # venv present but unusable (permissions, half-deleted)
+        return f"venv nicht ausführbar: {exc}"
+    return None
+
+
 def _mark_done(name: str) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     _marker(name).write_text("ok", encoding="utf-8")
@@ -271,9 +293,23 @@ def step_detect(config) -> gpu_detect.Detection:
 
 def step_deps(config, det: gpu_detect.Detection) -> None:
     index, step = 4, "deps"
+    torch_version = det.torch_version or config.torch_version
     if _is_done(step):
-        ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten vorhanden", skipped=True)
-        return
+        problem = _existing_venv_problem(config, torch_version)
+        if problem is None:
+            ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten vorhanden", skipped=True)
+            return
+        # The marker says "installed", the venv says otherwise. Rebuilding is
+        # the only repair the user could perform by hand anyway (the error texts
+        # say as much), and leaving the marker in place would hand the broken
+        # venv to the model step, which then fails somewhere that explains
+        # nothing. Costs a reinstall — but only for an install that is already
+        # unusable, never for a healthy one.
+        ndjson.log(
+            f"Vorhandene Installation unbrauchbar ({problem}) — wird neu gebaut",
+            level="warning",
+        )
+        _clear_done(step)
     ndjson.progress(index, TOTAL_STEPS, step, "Erstelle venv …")
     # A backend may demand its own interpreter: AMD's native-Windows ROCm wheels
     # are cp312-only, while everything else runs on the configured 3.11. uv
@@ -285,9 +321,8 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
     _run_uv(["venv", str(VENV_DIR), "--clear", "--python", python_version], index, step)
 
     py = str(_venv_python())
-    torch_version = det.torch_version or config.torch_version
     torch_pin = f"torch=={torch_version}"
-    audio_pin = f"torchaudio=={config.torchaudio_version}"
+    audio_pin = f"torchaudio=={det.torchaudio_version or config.torchaudio_version}"
 
     if det.wheel_urls:
         # ROCm on Windows needs its runtime SDK in the venv before torch, and it
@@ -322,13 +357,16 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
     # `isin_mps_friendly`; coqui-tts's own `>=4.57` has no upper bound and would
     # otherwise drag in a 5.x that crashes XTTS at model-load).
     ndjson.progress(index, TOTAL_STEPS, step, "Installiere Engine-Abhängigkeiten (F5 + XTTS) …", percent=50)
+    # The datasets floor rides along in the SAME resolution for the same reason
+    # as the transformers pin: f5-tts leaves `datasets` unconstrained, and a
+    # pre-2.16 pick installs fine and then dies on `import f5_tts.api` with a
+    # pyarrow AttributeError (see config.datasets_constraint).
     _run_uv(
         ["pip", "install", "--python", py,
-         str(WRAPPER_ROOT), "coqui-tts", config.transformers_constraint],
+         str(WRAPPER_ROOT), "coqui-tts",
+         config.transformers_constraint, config.datasets_constraint],
         index, step,
     )
-
-    _install_chatterbox(config, py, index, step)
 
     # The project deps (f5-tts, or coqui-tts for XTTS) can win the torch
     # resolution and pull a build that re-introduces the FFmpeg requirement via
@@ -341,7 +379,19 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
 
     for extra in det.extra_packages:
         ndjson.progress(index, TOTAL_STEPS, step, f"Installiere {extra} …", percent=90)
-        _run_uv(["pip", "install", "--python", py, extra], index, step)
+        # The torch pin travels WITH the extra. `torch-directml` declares
+        # `torch==2.4.1`, so installed on its own it just moved torch and the
+        # verification below failed the install (every released version, every
+        # AMD/Windows machine). With the pin in the same resolution the extra
+        # either agrees with the venv or the install fails HERE, where the
+        # message names the package that disagreed. The backend index comes
+        # along as an EXTRA index: the extras themselves live on PyPI, which
+        # `--index-url` would replace outright.
+        _run_uv(
+            ["pip", "install", "--python", py, extra, torch_pin, audio_pin,
+             "--extra-index-url", det.torch_index_url],
+            index, step,
+        )
 
     # Verify BEFORE marking done: the project install (f5-tts) can win the torch
     # resolution and leave behind a PyPI CPU build + torchcodec, which loads fine
@@ -349,77 +399,47 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
     # libtorchcodec"). If that slipped past the re-pin/uninstall, fail loudly so
     # ``deps.done`` is NOT written and the next run rebuilds — never freeze a
     # broken venv behind the marker (SPEC §3 idempotency must not cache garbage).
-    _verify_torch(py, config, expected_version=torch_version)
-    _verify_transformers(py)
-    _verify_chatterbox(py, config)
+    _verify_venv(py, config, torch_version)
 
     _mark_done(step)
     ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten installiert", done=True)
 
 
-def _install_chatterbox(config, py: str, index: int, step: str) -> None:
-    """Install the Chatterbox engine — the one that cannot join the resolution.
+def _verify_venv(py: str, config, torch_version: str) -> None:
+    """Run every install assertion against an existing venv.
 
-    ``chatterbox-tts`` pins ``torch==2.6.0`` and ``transformers==5.2.0`` and
-    pulls in gradio: the first fights this wrapper's torch pin, the second is
-    exactly the 5.x that breaks XTTS at model-load, and the third is a web UI we
-    do not use. Its actual transformers usage is limited to long-stable APIs
-    (``LlamaModel``/``LlamaConfig``/``GPT2*``/``GenerationMixin``) — identical in
-    the release pinning 4.46 and the one pinning 5.2 — so it is installed with
-    ``--no-deps`` plus the curated package list from ``config.chatterbox_install``
-    (live-verified against torch 2.7.0+cu128 / transformers 4.57.6).
-
-    The dependency install carries the transformers pin along, so a curated dep
-    cannot quietly drag it to a 5.x — the torch re-pin that follows in
-    :func:`step_deps` repairs torch, but nothing would repair transformers.
-    torch is deliberately NOT named here: a bare ``torch==`` without the
-    backend's ``--index-url`` is how a CPU wheel from PyPI ends up overwriting a
-    CUDA/ROCm build, and the re-pin already covers that case with the right
-    index (and the right version — AMD's Windows build is not the configured
-    pin).
+    Called twice, and the second call is the point: once before ``deps.done`` is
+    written (a bad fresh resolve must not be cached), and once when that marker
+    already exists, because a marker is only ever evidence that an install
+    *finished* — not that it still works. A venv can rot after the fact: a hand
+    patch, a shared/relocated install, or simply an older wrapper whose install
+    steps predate a fix. Re-checking costs a few imports; skipping it means the
+    bootstrap steps straight over the broken part and the failure resurfaces
+    later inside model download or first inference, where nothing points back
+    here.
     """
-    spec = config.chatterbox_install or {}
-    package = spec.get("package")
-    if not package:  # explicitly disabled by config → engine simply unavailable
-        return
-    ndjson.progress(index, TOTAL_STEPS, step, "Installiere Chatterbox …", percent=60)
-    _run_uv(["pip", "install", "--python", py, "--no-deps", str(package)], index, step)
-    deps = [str(d) for d in (spec.get("deps") or [])]
-    if deps:
-        _run_uv(
-            ["pip", "install", "--python", py, *deps, config.transformers_constraint],
-            index, step,
-        )
+    _verify_torch(py, config, expected_version=torch_version)
+    _verify_transformers(py)
+    _verify_f5(py)
 
 
-def _verify_chatterbox(py: str, config) -> None:
-    """Assert the Chatterbox engine can actually load — before ``deps.done``.
+def _verify_f5(py: str) -> None:
+    """Assert the F5 engine imports — the resolution has more ways to rot than torch.
 
-    Two failure modes this catches, both of which otherwise surface only when
-    somebody picks ``--tts-backend chatterbox``, long after the install "worked":
-
-    * a missing/renamed import (e.g. a chatterbox release that really does need
-      transformers 5.x);
-    * ``perth.PerthImplicitWatermarker is None``. The watermarker imports
-      ``pkg_resources``, which setuptools 81+ no longer ships; perth swallows
-      that ImportError and sets the class to ``None``, so the model constructor
-      dies with the useless "'NoneType' object is not callable". Hence the
-      ``setuptools<81`` entry in the curated deps — and this assertion.
+    Reported live: an old ``datasets`` (pre-2.16) subclasses
+    ``pyarrow.PyExtensionType``, which pyarrow removed, so the install succeeds
+    and the FIRST use dies with "module 'pyarrow' has no attribute
+    'PyExtensionType'" from a traceback whose frames name neither the wrapper
+    nor the pinned package. ``config.datasets_constraint`` prevents that
+    particular resolution; this import catches whatever the next one is,
+    including in a venv that predates the constraint.
     """
-    if not (config.chatterbox_install or {}).get("package"):
-        return
-    code = (
-        "import perth;"
-        "from chatterbox.mtl_tts import ChatterboxMultilingualTTS;"
-        "assert perth.PerthImplicitWatermarker is not None, 'perth watermarker unavailable'"
-    )
-    proc = procutil.run([py, "-c", code])
+    proc = procutil.run([py, "-c", "import f5_tts.api"])
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
         raise FatalError(
-            "chatterbox verification failed: " + " | ".join(tail) + ". "
-            "Check config.chatterbox_install (it installs --no-deps on purpose); "
-            "delete .venv and .state/deps.done and rerun."
+            "f5-tts verification failed: " + " | ".join(tail) + ". "
+            "Delete .venv and .state/deps.done and rerun."
         )
 
 
@@ -515,9 +535,8 @@ def step_model(config) -> None:
         ndjson.progress(index, TOTAL_STEPS, step, "Sprachmodelle vorhanden", skipped=True)
         return
     # Download the weights for ALL engines (chosen at start, not install):
-    #   F5         → every language's checkpoint (en/de/fr/ja), SPEC §14.3.
-    #   XTTS       → the one multilingual XTTS-v2 model.
-    #   Chatterbox → the one multilingual Chatterbox model.
+    #   F5   → every language's checkpoint (en/de/fr/ja), SPEC §14.3.
+    #   XTTS → the one multilingual XTTS-v2 model.
     env = _server_env(config)
     # Let the download sub-processes emit their per-file progress bars onto THIS
     # same "Step 5/6 · model" bar (src.progress.ModelProgress reads these).
@@ -531,10 +550,6 @@ def step_model(config) -> None:
     rc = _popen_forward([str(_venv_python()), "-m", "src.xtts_backend"], env)
     if rc != 0:
         raise FatalError("XTTS-Modell-Download fehlgeschlagen (siehe stderr/Log)")
-    ndjson.progress(index, TOTAL_STEPS, step, "Lade Chatterbox-Modell …", percent=75)
-    rc = _popen_forward([str(_venv_python()), "-m", "src.chatterbox_backend"], env)
-    if rc != 0:
-        raise FatalError("Chatterbox-Modell-Download fehlgeschlagen (siehe stderr/Log)")
     # Voices, not weights — and deliberately NOT fatal: a failed voice pack means
     # "no voices yet", which the user can fix by dropping in a wav. It must never
     # keep an otherwise working install from starting, so a non-zero exit only
