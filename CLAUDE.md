@@ -209,6 +209,16 @@ longer exists.)
   (must work offline and in the container). Requests `format:"wav"` and plays the blob in an
   `<audio>` element; revokes the previous blob URL on each run or every generation leaks one. Key is
   kept in `localStorage`. Ships in the image via `COPY wrapper/src ./src`.
+  - **Schickt `speed` UND `nfe_step`** (seit 2026-09-07). Das Feld war im `/tts`-Body längst da, aber
+    nur über die HTTP-API erreichbar — weshalb der Hörvergleich 32 gegen 16 nie gemacht wurde.
+    `nfe_step` ist der billigste Tempo-Hebel: halbe Schrittzahl ≈ halbe GPU-Arbeit (5090, gleicher
+    Satz: rtf 0,32 bei 32 gegen 0,17 bei 16). Es ist **F5-only** — XTTS klont aus dem Audio und
+    ignoriert den Wert, das Feld wird dort also deaktiviert statt still wirkungslos zu sein. Die
+    Statuszeile nennt den benutzten Wert neben dem rtf, damit ein A/B-Lauf sich selbst dokumentiert.
+  - **`server.TtsRequest` begrenzt seither `speed` (0 < s ≤ 3) und `nfe_step` (4…128).** Beide gehen
+    unverändert in die Engine, und beide sind jetzt Formularfelder: `speed = 0` ist nicht langsam
+    sondern undefiniert, und ein riesiger `nfe_step` belegt einen Worker minutenlang (der Pool gibt
+    genau einen je Anfrage aus) — auf einer geteilten Instanz ein billiger Stillstand.
 - `src/ratelimit.py` — `RateLimiter` (sliding one-hour window; `rate_limit_per_hour` global +
   `rate_limit_per_ip_per_hour`, both 0 = off) + `client_address()`. **Not back-pressure:**
   `engine.admit()` answers 503 "busy now", this answers **429** "your share for this hour" — and it

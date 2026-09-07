@@ -287,3 +287,36 @@ def test_untrusted_forwarded_for_cannot_dodge_the_per_ip_limit(config):
         # bucket while trust_forwarded_for is off.
         r = c.post("/tts", json=body, headers={"X-Forwarded-For": "9.9.9.9"})
         assert r.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# Generation parameter bounds
+#
+# Both values reach the engine unchanged and are now editable in the built-in
+# web UI. A speed of 0 is undefined rather than slow, and a huge nfe_step holds
+# a worker (the pool hands out exactly one per request) for minutes.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("speed", [0, -1, 3.5])
+def test_tts_rejects_impossible_speed(client, speed):
+    r = client.post("/tts", json={"sample": "anna_de.wav", "text": "Hallo.", "speed": speed})
+    assert r.status_code == 422
+
+
+@pytest.mark.parametrize("nfe", [0, -8, 100000])
+def test_tts_rejects_impossible_nfe_step(client, nfe):
+    r = client.post("/tts", json={"sample": "anna_de.wav", "text": "Hallo.", "nfe_step": nfe})
+    assert r.status_code == 422
+
+
+def test_tts_still_accepts_the_useful_range(client):
+    """The guard rail must not narrow what people actually use.
+
+    nfe 16 is the cheap-quality setting worth A/B-ing on a weak GPU: it halves
+    the flow-matching passes and therefore the GPU work.
+    """
+    r = client.post(
+        "/tts",
+        json={"sample": "anna_de.wav", "text": "Hallo.", "speed": 0.5, "nfe_step": 16},
+    )
+    assert r.status_code == 200

@@ -85,6 +85,11 @@
         <input id="speed" type="number" value="1.0" step="0.05" min="0.5" max="2.0"
                title="Playback speed passed to the engine">
       </label>
+      <label style="flex:0 0 8rem">
+        <span>NFE steps</span>
+        <input id="nfe" type="number" value="32" step="4" min="4" max="64"
+               title="F5 only: denoising steps per clip. Halving them halves the GPU work.">
+      </label>
       <label style="flex:1 1 12rem">
         <span>API key <em style="text-transform:none">(only if configured)</em></span>
         <input id="key" type="password" placeholder="leave empty if unset" autocomplete="off">
@@ -139,6 +144,17 @@ async function loadMeta() {
     ` · ${health.workers} worker(s)` +
     (health.xtts_fp16 ? " · fp16" : "");
 
+  // NFE steps are an F5 concept: the number of flow-matching passes over the
+  // whole sequence, so halving them halves the GPU work — the cheapest lever
+  // there is on a card that also runs a game. XTTS ignores the field entirely
+  // (it clones from the audio), so the control is disabled rather than quietly
+  // doing nothing.
+  const nfeUsed = health.tts_backend === "f5";
+  $("nfe").disabled = !nfeUsed;
+  $("nfe").title = nfeUsed
+    ? "Denoising steps per clip. Fewer = less GPU work and faster, at some quality cost."
+    : "F5 only — XTTS clones from the audio and ignores this value";
+
   // The language selector is driven by /languages, which knows the backend
   // rule: F5 loads ONE model per process, so the field is locked there.
   const langs = await getJSON("/languages");
@@ -191,6 +207,7 @@ async function generate() {
         text: text,
         language: $("lang").value,
         speed: parseFloat($("speed").value) || 1.0,
+        nfe_step: parseInt($("nfe").value, 10) || 32,
         format: "wav",
       }),
     });
@@ -209,7 +226,9 @@ async function generate() {
     // 44 = RIFF header, 2 bytes per sample, mono.
     const seconds = (blob.size - 44) / 2 / 24000;
     const took = (performance.now() - started) / 1000;
-    say(`${seconds.toFixed(1)}s of audio in ${took.toFixed(1)}s (rtf ${(took / seconds).toFixed(2)})`);
+    const nfeNote = $("nfe").disabled ? "" : `, nfe ${parseInt($("nfe").value, 10) || 32}`;
+    say(`${seconds.toFixed(1)}s of audio in ${took.toFixed(1)}s ` +
+        `(rtf ${(took / seconds).toFixed(2)}${nfeNote})`);
   } catch (err) {
     say(String(err.message || err), true);
   } finally {

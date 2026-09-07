@@ -44,8 +44,13 @@ class TtsRequest(BaseModel):
     text: str
     language: Optional[str] = None
     ref_text: Optional[str] = None
-    speed: float = 1.0
-    nfe_step: int = 32
+    # Bounded because both reach the engine unchecked otherwise, and both are
+    # now editable in the built-in UI. speed <= 0 is not slow, it is undefined;
+    # a huge nfe_step holds a worker for minutes (the pool takes exactly one per
+    # request), which is a cheap way to stall a shared instance. The ranges are
+    # deliberately wider than anything useful — this is a guard rail, not taste.
+    speed: float = Field(1.0, gt=0.0, le=3.0)
+    nfe_step: int = Field(32, ge=4, le=128)
     # "pcm" (default) streams raw s16le as it is generated — what the plugin
     # consumes. "wav" buffers the whole clip and prepends a RIFF header, because
     # a browser cannot play headerless PCM; it is what the built-in web UI uses.

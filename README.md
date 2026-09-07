@@ -307,6 +307,19 @@ no CDN, works offline and inside the container.
 | `GET /health`        | Backend/device/worker/queue status, plus `rate_limit` usage.       |
 | `POST /shutdown`     | Graceful shutdown.                                                 |
 
+**Request body:** `sample` (voice name, required) and `text`, plus optional `language`, `ref_text`,
+`speed` (0 < s ≤ 3) and `nfe_step` (4 … 128, default 32). Both numeric fields are bounded because
+they reach the engine unchanged: a `speed` of 0 is undefined rather than slow, and a huge `nfe_step`
+holds a worker for minutes — the pool hands out exactly one per request.
+
+**`nfe_step` is the cheapest speed lever, and it is F5-only.** It is the number of flow-matching
+passes over the whole clip, so halving it roughly halves the GPU work: on an RTX 5090 the same
+German sentence measured **rtf 0.32 at 32 steps and 0.17 at 16**. Quality at 16 is a judgement call
+you have to make by ear — the web UI exposes the field next to `speed` for exactly that comparison.
+XTTS clones from the audio and ignores the value, so the control is disabled when it is the active
+backend. This matters most on a modest GPU that is also running a game, where the wall clock is
+compute-bound rather than the mostly-idle case a high-end card measures.
+
 Configuration lives in `wrapper/config.json` (overridable by `F5W_*` env vars and `--kebab-case` CLI
 flags; precedence JSON < ENV < CLI). The server **binds `0.0.0.0` by default** so the host reaches it
 with no config edit; this also exposes it on your LAN, so set an `api_key` (then all requests need
