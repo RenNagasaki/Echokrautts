@@ -10,6 +10,7 @@ breaks on a user's machine. Hence these tests.
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -19,6 +20,12 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SCRIPT = REPO_ROOT / "build-release-zip.py"
+
+# The whole module asks git what to package, so without git there is nothing to
+# assert. This matters in CI: the pipeline runs on `python:3.12-slim`, where the
+# checkout is done by the runner's helper container and the job image itself has
+# no git binary at all.
+pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git on PATH")
 
 
 def _load_builder():
