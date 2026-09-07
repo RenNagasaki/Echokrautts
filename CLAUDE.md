@@ -253,6 +253,26 @@ longer exists.)
   blanket "every field survives" check, so a new config field can't fall out of the handover.
 - `bootstrap/install_win.ps1` / `install_linux.sh` — thin starters that fetch `uv` then run bootstrap.
 
+## Release-Asset bauen (`build-release-zip.py`, Repo-Root)
+- `python build-release-zip.py` schreibt **`wrapper/EchokrauTTS.zip`** (gitignored); Release danach
+  von Hand auf GitHub anlegen und die Datei hochladen. `--list` zeigt nur, was hineinkäme.
+- **Layout ist Vorgabe des C#-Hosts, keine Wahl:** er lädt das Asset, entpackt es nach
+  `<installRoot>/echokrautts` und startet dort `bootstrap/bootstrap.py`. Im Archiv liegt deshalb der
+  INHALT von `wrapper/` in der Wurzel, ohne `wrapper/`-Präfix — verifiziert gegen das echte
+  0.0.0.4-Asset (identische Top-Level-Struktur, keine Datei verloren).
+- **Was hineinkommt, entscheidet git**, nie eine Handliste: `git ls-files --cached --others
+  --exclude-standard`. Bewusst NICHT nur `--cached` — ein Release, direkt nach dem Schreiben einer
+  neuen Datei gebaut, hätte sonst genau den Code nicht drin, für den es gemacht wurde. Umgekehrt
+  fallen `.venv`, `.state`, `models`, geladene `samples`, `__pycache__` und das Archiv selbst
+  automatisch raus, weil `.gitignore` sie schon kennt.
+- **`__pycache__` aus dem 0.0.0.4-Asset ist bewusst weg** (dort ~180 KB von 226 KB): Bytecode ist
+  veraltet, sobald sich eine Quelle ändert, und auf einer anderen Python-Version toter Ballast.
+  Neues Archiv: 47 Dateien, 107 KB.
+- **Reproduzierbar**: feste Zeitstempel + sortierte Reihenfolge ⇒ zwei Bauläufe derselben Quellen
+  sind bytegleich, sonst lässt sich „hat sich das Paket wirklich geändert?" nicht durch einen
+  Dateivergleich beantworten. Geschrieben wird über eine `.part`-Datei (wie beim Voice-Pack), damit
+  ein Abbruch kein halbes Archiv hinterlässt, das fertig aussieht.
+
 ## Docs & licenses (repo ROOT, not `wrapper/`)
 - `README.md` — user-facing docs (backends, **Docker**, HTTP API, languages, licensing). The Docker
   section is the deployment reference: images/tags, both volumes and what breaks without them, the

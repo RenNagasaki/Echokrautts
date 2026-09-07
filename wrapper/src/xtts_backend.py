@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import ndjson, progress
+from . import ndjson, progress, selftest
 from .config import Config, load_config
 
 # Coqui model id for XTTS-v2 (multilingual, multi-dataset).
@@ -305,18 +305,7 @@ class XTTSWorker:
     def self_test(self) -> bool:
         """Tiny inference to confirm the backend works (engine runs this only
         for fragile dml/xpu devices, which XTTS anyway maps to CPU)."""
-        try:
-            import tempfile
-
-            import soundfile as sf
-
-            with tempfile.TemporaryDirectory() as tmp:
-                ref = Path(tmp) / "selftest.wav"
-                sf.write(ref, np.zeros(self.sample_rate, dtype=np.float32), self.sample_rate)
-                self.infer(str(ref), "", "test", nfe_step=8, speed=1.0)
-            return True
-        except Exception:  # noqa: BLE001 — any failure means "fall back to CPU"
-            return False
+        return selftest.run(self)
 
 
 def download_model(config: Config) -> None:

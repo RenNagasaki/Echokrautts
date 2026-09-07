@@ -6,3 +6,7 @@
 
 # Machine-local Claude Code state (worklog, verify script).
 .claude/
+
+# Python bytecode from tooling run at the repo root (e.g. the release
+# builder imported by its tests). The wrapper has its own .gitignore.
+__pycache__/

@@ -25,7 +25,7 @@ from typing import AsyncIterator, Callable, Iterator, Optional, Protocol
 
 import numpy as np
 
-from . import audio_compat, ndjson
+from . import audio_compat, ndjson, selftest
 from .config import Config
 from .gpu_detect import Detection
 from .jobs import CANCELLED, DONE, ERROR, Job, JobRegistry
@@ -126,18 +126,7 @@ class F5TTSWorker:
 
     def self_test(self) -> bool:
         """Tiny inference to confirm the backend's op-coverage (SPEC §4.2)."""
-        try:
-            import tempfile
-
-            import soundfile as sf
-
-            with tempfile.TemporaryDirectory() as tmp:
-                ref = Path(tmp) / "selftest.wav"
-                sf.write(ref, np.zeros(self.sample_rate, dtype=np.float32), self.sample_rate)
-                self.infer(str(ref), "test", "test", nfe_step=8, speed=1.0)
-            return True
-        except Exception:  # noqa: BLE001 — any failure means "fall back to CPU"
-            return False
+        return selftest.run(self)
 
 
 WorkerFactory = Callable[[int, str], WorkerProtocol]
