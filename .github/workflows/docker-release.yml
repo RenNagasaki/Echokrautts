@@ -6,11 +6,13 @@
 #  push would otherwise burn ~40 minutes of runner time on a multi-GB CUDA
 #  image nobody asked for.
 #
-#  Produces two variants from ONE Dockerfile:
+#  Produces three variants from ONE Dockerfile:
 #    ghcr.io/rennagasaki/echokrautts:<version>        (CUDA / cu128)
 #    ghcr.io/rennagasaki/echokrautts:latest
-#    ghcr.io/rennagasaki/echokrautts:<version>-cpu
+#    ghcr.io/rennagasaki/echokrautts:<version>-cpu    (CPU only)
 #    ghcr.io/rennagasaki/echokrautts:latest-cpu
+#    ghcr.io/rennagasaki/echokrautts:<version>-rocm   (AMD / ROCm 6.4)
+#    ghcr.io/rennagasaki/echokrautts:latest-rocm
 #
 #  The `latest` tags are skipped for pre-releases.
 # ============================================================================
@@ -130,7 +132,7 @@ jobs:
             ECHOKRAUTTS_VERSION=${{ steps.meta.outputs.version }}
             VARIANT=${{ matrix.variant }}
           provenance: false
-          # Cache per variant — the two share no layers past the base image
+          # Cache per variant — they share no layers past the base image
           # because the torch install differs.
           cache-from: type=gha,scope=${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
