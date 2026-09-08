@@ -1,7 +1,8 @@
 # Echokrautts
 
-A lightweight, plug-and-play Python wrapper around two **voice-cloning TTS** engines —
-[F5-TTS](https://github.com/SWivid/F5-TTS) and [XTTS-v2](https://huggingface.co/coqui/XTTS-v2) —
+A lightweight, plug-and-play Python wrapper around three **voice-cloning TTS** engines —
+[F5-TTS](https://github.com/SWivid/F5-TTS), [XTTS-v2](https://huggingface.co/coqui/XTTS-v2) and
+[MOSS-TTS-Nano](https://github.com/OpenMOSS/MOSS-TTS-Nano) —
 that a host application (e.g. a C#/Dalamud plugin) starts as a **separate process** and drives
 over stdout (NDJSON events) and HTTP (streaming PCM). It provides zero-shot voice cloning with
 sentence-level streaming, a VRAM-aware worker pool, and self-contained installation via
@@ -20,10 +21,12 @@ start-f5tts.bat        # Windows, F5-TTS backend (visible window, pauses at the 
 ./start-f5tts.sh       # Linux/macOS, F5-TTS backend
 start-xtts.bat         # Windows, XTTS-v2 backend
 ./start-xtts.sh        # Linux/macOS, XTTS-v2 backend
+start-moss.bat         # Windows, MOSS-TTS-Nano backend
+./start-moss.sh        # Linux/macOS, MOSS-TTS-Nano backend
 ```
 
-Both engines and all their weights are installed either way; the launcher only picks (via
-`--tts-backend f5` / `xtts`) which engine the worker pool loads at startup, so
+All engines and all their weights are installed either way; the launcher only picks (via
+`--tts-backend f5` / `xtts` / `moss`) which engine the worker pool loads at startup, so
 switching is a restart, not a reinstall. All launchers forward extra arguments, e.g.
 `start-xtts.bat --language en`.
 
@@ -108,7 +111,7 @@ no separate Docker configuration schema. The ones that actually matter in a cont
 
 | Variable | Image default | Meaning |
 | --- | --- | --- |
-| `F5W_TTS_BACKEND` | `xtts` | `xtts` = XTTS-v2, clones from the sample alone, multilingual per request. `f5` = F5-TTS, loads **one** language finetune per process and needs a transcript (or ASR) for the reference clip. |
+| `F5W_TTS_BACKEND` | `xtts` | `xtts` = XTTS-v2, clones from the sample alone, multilingual per request. `f5` = F5-TTS, loads **one** language finetune per process and needs a transcript (or ASR) for the reference clip. `moss` = MOSS-TTS-Nano, multilingual and streaming like XTTS, no transcript needed, and small enough to run on the CPU. |
 | `F5W_LANGUAGE` | `de` | F5: which finetune is loaded at startup. XTTS: the fallback when a request omits `language`. |
 | `F5W_XTTS_FP16` | unset (`false`) | XTTS half precision, ~1.4× faster. CUDA only — silently ignored on CPU. |
 | `F5W_API_KEY` | unset | Requires `Authorization: Bearer <key>` on every endpoint. **Set it if the port is reachable from anywhere but the host** — the server binds `0.0.0.0`. |
@@ -377,19 +380,51 @@ built-in ASR and cached. The `xtts` backend needs no transcript (it clones from 
 ## TTS backends
 
 The wrapper ships three interchangeable engines. A process loads **one** at startup, selected by
-`tts_backend` (config) or `--tts-backend <f5|xtts>` (default `f5`). `GET /health` reports
+`tts_backend` (config) or `--tts-backend <f5|xtts|moss>` (default `f5`). `GET /health` reports
 the active backend. All engines are installed by the bootstrap, so switching is only a restart.
 
 | Backend | Model | Reference transcript | Notes |
 |---------|-------|----------------------|-------|
 | `f5`   | F5-TTS finetunes (per language) | needed — from a sidecar `.txt`, the request's `ref_text`, or auto-transcribed via F5's built-in ASR | code MIT, weights CC-BY-NC |
 | `xtts` | Coqui XTTS-v2 (one multilingual model) | **not needed** — clones from the audio alone | code MPL-2.0, weights CPML (non-commercial) |
+| `moss` | MOSS-TTS-Nano 0.1B (one multilingual model, 19 languages) | **not needed** — clones from the audio alone | code **and weights Apache-2.0** — the only unencumbered output here |
+
+**Which one should you pick?** `xtts` for the best voices on a machine that can spare the GPU,
+`f5` when you want the lowest total generation time and only need one language per process, and
+`moss` when the graphics card is busy with something else — a game, most likely. MOSS is a 0.1B
+model and sounds like one: noticeably rougher than the other two. It earns its place by being
+usable at all on hardware where the others compete with the game for the card.
+
+### MOSS-TTS-Nano specifics
+
+**It does not need the GPU, and by default it does not take it.** Measured on an RTX 5090, CPU and
+GPU produce the same real-time factor (1.25 vs 1.22), so `moss_device` defaults to **`cpu`** — start
+it and the graphics card stays with your game, no flag required. Set `moss_device` to `cuda` to use
+the GPU anyway (a weak CPU with a strong GPU is the case that wants it), or `auto` to follow the
+engine's own detection. All three work as a config entry, a `--moss-device` flag or `F5W_MOSS_DEVICE`.
+
+**Fast to first sound.** It streams for real: 32–64 audio chunks per sentence, with the first one
+arriving after **0.12 s on GPU / 0.45 s on CPU** — against ~2.4 s for XTTS. Time-to-first-sound is
+what makes speech feel immediate in a game, far more than the total.
+
+**Small**: 312 MB of weights (a 227 MB model plus its separate 85 MB audio tokenizer) against F5's
+~5 GB and XTTS's ~2 GB.
+
+**The honest limit:** rtf ~1.25 is *slower than real time*. Streaming hides it for the short lines a
+game speaks — playback starts long before generation ends — but a long sentence will be caught up
+with. That is the price of a model this small; F5 (0.32) and XTTS (0.44) are faster in total while
+being slower to the first sound.
+
+`speed` has no equivalent and is ignored (reported once in the log; the web UI disables the
+control). The language field is validated against the 19 languages the model knows, but MOSS infers
+the language from the text itself — the value is not passed to the model.
+
 
 ## Languages
 
 Every request may carry a `language` field; how it is treated depends on the backend. `f5` serves
 **one language per process**, chosen at startup via `language` (config) or `--language <code>`, with
-each language mapping to a distinct model in the `languages` config block. `xtts`
+each language mapping to a distinct model in the `languages` config block. `xtts` and `moss`
 each cover all their languages with a **single multilingual model**, so the per-request `language`
 picks the target language on the fly — **no restart or reload**. Omitting `language` falls back to
 the startup language in every case. `GET /languages` answers this per backend (which is what the web
@@ -431,6 +466,8 @@ The unit suite mocks F5-TTS/torch, so it runs anywhere without GPU or multi-GB d
   runtime into `wrapper/models/`.
   - F5-TTS weights (base + finetunes): **CC-BY-NC-4.0** — non-commercial.
   - XTTS-v2 weights: **Coqui Public Model License (CPML)** — non-commercial.
+  - MOSS-TTS-Nano weights: **Apache-2.0** — no such restriction. Audio produced with
+    `--tts-backend moss` is yours to use commercially.
   The synthesized audio (model *output*) inherits the terms of whichever engine produced it, so with
   `f5` or `xtts` **you may not use it commercially** without a separate license from the rights
   holder. Keep each model's license notice with any distribution and do not relicense the weights.

@@ -67,11 +67,52 @@ class Config:
     # (and where datasets declares a pyarrow floor of its own, so the two can no
     # longer drift apart). Passed verbatim to `uv pip install` in step_deps.
     datasets_constraint: str = "datasets>=3.0"
+    # MOSS-TTS-Nano: two HuggingFace repos, because the model and its audio
+    # tokenizer ship separately and BOTH are needed — a checkpoint without its
+    # matching tokenizer produces noise rather than an error.
+    moss_model: str = "OpenMOSS-Team/MOSS-TTS-Nano"
+    moss_audio_tokenizer: str = "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano"
+    # Where MOSS runs, overriding the engine's device choice. **Defaults to the
+    # CPU, and that is the point of this backend rather than a limitation:**
+    # measured on this project's hardware, CPU and an RTX 5090 produce the same
+    # real-time factor (1.25 vs 1.22), so the GPU buys nothing here and staying
+    # off it leaves the card to whatever game is running. Defaulting to "auto"
+    # would quietly take the GPU — the exact thing MOSS was added to avoid.
+    # Set "cuda" to use it anyway (a weak CPU with a strong GPU is the case that
+    # wants it), or "auto" to follow whatever the engine detected.
+    moss_device: str = "cpu"
+    # Ceiling on MOSS's decode loop, in audio frames (the runtime's own unit and
+    # default). It bounds a generation that never stops on its own; the value is
+    # far above any single sentence chunk, so it does not truncate real speech.
+    moss_max_new_frames: int = 375
+    # How MOSS is installed. It publishes no PyPI package, so this is a pinned
+    # source tarball — a COMMIT, not a branch, because a moving `main` would
+    # change what users get without anything in this repo changing. The GitHub
+    # archive URL is used rather than `git+https://`, since pip would then need
+    # git on the machine and a one-click installer cannot assume that.
+    # `--no-deps` keeps its `torch==2.7.0` pin from reaching PyPI and replacing
+    # the CUDA build with a CPU one; the torch re-pin in the bootstrap owns torch.
+    # WeTextProcessing is deliberately absent: it needs `pynini`, which has no
+    # Windows wheels, and it is optional (lazily imported, and there are only
+    # zh/en normalizers anyway).
+    moss_install: dict = field(
+        default_factory=lambda: {
+            "package": (
+                "https://github.com/OpenMOSS/MOSS-TTS-Nano/archive/"
+                "8b7bcc9341b3b4ef3a3a58ba1338a7d85ff133eb.tar.gz"
+            ),
+            "deps": ["sentencepiece"],
+        }
+    )
     # TTS backend engine the worker pool loads at startup (one per process):
     #   "f5"         → F5-TTS finetunes (needs a ref-text per sample; CC-BY-NC)
     #   "xtts"       → Coqui XTTS-v2 (clones from audio only, no ref-text; CPML)
-    # The bootstrap installs BOTH engines + all their models, so switching is a
-    # restart with a different --tts-backend (no reinstall). See xtts_backend.py.
+    #   "moss" → MOSS-TTS-Nano (audio-only clone, 19 languages, real streaming,
+    #             Apache-2.0 code AND weights, and fast enough on the CPU that
+    #             the GPU can stay with the game — see moss_backend.py)
+    # The bootstrap installs ALL engines + all their models, so switching is a
+    # restart with a different --tts-backend (no reinstall). See xtts_backend.py
+    # and moss_backend.py.
     tts_backend: str = "f5"
     # Active language at startup; selects which model the worker pool loads.
     # The per-request ``language`` field must match this (or be omitted).
@@ -243,6 +284,7 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
         "stream_chunk_size",
         "rate_limit_per_hour",
         "rate_limit_per_ip_per_hour",
+        "moss_max_new_frames",
     ):
         return int(raw)
     if name in ("vram_reserve_gb", "per_job_gb"):
@@ -261,7 +303,7 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
         raise ValueError(f"invalid bool for {name}: {raw!r}")
     if name == "allowed_sample_ext":
         return [s.strip() for s in raw.split(",") if s.strip()]
-    if name in ("languages", "rocm_windows"):
+    if name in ("languages", "rocm_windows", "moss_install"):
         return json.loads(raw)
     if name in ("api_key", "hf_endpoint", "torch_index_override"):
         return None if raw == "" or raw.lower() == "null" else raw

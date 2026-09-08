@@ -320,3 +320,35 @@ def test_tts_still_accepts_the_useful_range(client):
         json={"sample": "anna_de.wav", "text": "Hallo.", "speed": 0.5, "nfe_step": 16},
     )
     assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# MOSS-TTS-Nano: multilingual in one model, and it streams
+# ---------------------------------------------------------------------------
+
+def test_languages_open_for_moss(config):
+    config.tts_backend = "moss"
+    engine = make_engine(config)
+    with TestClient(create_app(config=config, engine=engine)) as c:
+        body = c.get("/languages").json()
+    assert body["locked"] is False
+    assert {"en", "ja", "de", "fr"} <= set(body["options"])
+
+
+def test_tts_moss_accepts_per_request_language(config):
+    config.tts_backend = "moss"
+    engine = make_engine(config)
+    with TestClient(create_app(config=config, engine=engine)) as c:
+        r = c.post("/tts", json={"sample": "anna_de.wav", "text": "Hallo.", "language": "ja"})
+    assert r.status_code == 200
+
+
+def test_tts_moss_rejects_an_untrained_language(config):
+    """MOSS infers the language from the text, so a bad code would not crash —
+    it would return confident nonsense. Rejecting it is the useful behaviour."""
+    config.tts_backend = "moss"
+    engine = make_engine(config)
+    with TestClient(create_app(config=config, engine=engine)) as c:
+        r = c.post("/tts", json={"sample": "anna_de.wav", "text": "Hi.", "language": "zh-cn"})
+    assert r.status_code == 400
+    assert "MOSS-TTS-Nano" in r.json()["detail"]

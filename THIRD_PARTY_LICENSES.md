@@ -9,10 +9,11 @@ The wrapper's own code is **AGPL-3.0** (see [`README.md`](README.md) → Licensi
 
 ## ⚠ Most model weights are NON-COMMERCIAL
 
-**Both engines ship non-commercial weights** (F5-TTS CC-BY-NC-4.0, XTTS-v2 CPML). The synthesized
-audio (the model *output*) inherits the terms of whichever model produced it — you may **not** use
-it for any purpose that earns direct or indirect payment without a separate commercial license from
-the respective rights holder. Since the active engine is a startup flag, **check which backend
+**Two of the three engines ship non-commercial weights** (F5-TTS CC-BY-NC-4.0, XTTS-v2 CPML); the
+third, MOSS-TTS-Nano, is Apache-2.0 for code *and* weights. The synthesized audio (the model
+*output*) inherits the terms of whichever model produced it — with F5 or XTTS you may **not** use it
+for any purpose that earns direct or indirect payment without a separate commercial license from the
+respective rights holder, while audio from MOSS carries no such restriction. Since the active engine is a startup flag, **check which backend
 produced a given clip** before
 using it commercially; `GET /health` reports it.
 
@@ -23,6 +24,8 @@ using it commercially; `GET /health` reports it.
 | F5-TTS French finetune | fr | [`RASPIAUDIO/F5-French-MixedSpeakers-reduced`](https://huggingface.co/RASPIAUDIO/F5-French-MixedSpeakers-reduced) | CC-BY-NC-4.0 |
 | F5-TTS Japanese finetune | ja | [`Jmica/F5TTS`](https://huggingface.co/Jmica/F5TTS) | CC-BY-NC-4.0 |
 | XTTS-v2 | en/de/fr/ja (+13 more) | [`coqui/XTTS-v2`](https://huggingface.co/coqui/XTTS-v2) | Coqui Public Model License (CPML) 1.0.0 — see [`licenses/XTTS-v2-CPML.txt`](licenses/XTTS-v2-CPML.txt) |
+| MOSS-TTS-Nano (0.1B) | en/de/fr/ja (+15 more) | [`OpenMOSS-Team/MOSS-TTS-Nano`](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Nano) | **Apache-2.0** — *not* restricted to non-commercial use |
+| MOSS Audio Tokenizer Nano | (codec, all languages) | [`OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano`](https://huggingface.co/OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano) | **Apache-2.0** — required alongside the model |
 
 **CPML note:** Coqui Inc. shut down in January 2024, so there is currently no vendor to sell an XTTS
 commercial license — treat XTTS-v2 as strictly non-commercial. The full CPML text is vendored at
@@ -32,7 +35,7 @@ longer guaranteed to be online.
 ## Python packages (installed into `.venv/`)
 
 The bootstrap installs these via `uv pip install` (torch from a backend-specific index; f5-tts +
-coqui-tts in one resolution). Transitive dependencies not listed here carry their own licenses.
+coqui-tts in one resolution; MOSS separately with `--no-deps` from a pinned GitHub archive, because it publishes no PyPI package and its own `torch==2.7.0` pin would otherwise replace the CUDA build with a CPU one). Transitive dependencies not listed here carry their own licenses.
 
 | Package | Role | License |
 |---------|------|---------|
@@ -50,13 +53,18 @@ coqui-tts in one resolution). Transitive dependencies not listed here carry thei
 
 | Tool | Role | License |
 |------|------|---------|
+| [`moss-tts-nano`](https://github.com/OpenMOSS/MOSS-TTS-Nano) | MOSS backend engine (installed `--no-deps` from a pinned source archive, see below) | Apache-2.0 |
+| [`sentencepiece`](https://github.com/google/sentencepiece) | tokenizer MOSS needs | Apache-2.0 |
 | [`uv`](https://github.com/astral-sh/uv) | fetched by the bootstrap to create the venv / install deps | Apache-2.0 OR MIT |
 
-## Note on the two engines
+## Note on the three engines
 
 - **f5-tts code is MIT** (permissive) but its **model weights are CC-BY-NC** — the two are separate.
   You may use the f5-tts code commercially; the weights only non-commercially.
 - **coqui-tts code is MPL-2.0** (permissive, file-level copyleft) but the **XTTS-v2 weights are
   CPML** (non-commercial). Same split.
-In both cases the *weights* — and therefore any synthesized audio — are the binding non-commercial
-constraint for typical use of this wrapper.
+- **MOSS-TTS-Nano is Apache-2.0 for both code and weights** — no such split, and the only engine
+  here whose output carries no non-commercial restriction.
+
+For F5 and XTTS the *weights* — and therefore any synthesized audio — are the binding
+non-commercial constraint for typical use of this wrapper; `--tts-backend moss` avoids it entirely.

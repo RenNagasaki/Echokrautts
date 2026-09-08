@@ -24,12 +24,15 @@ download_models() {
         return
     fi
     # Only the active backend's weights: F5 pulls all four language finetunes
-    # (~5 GB), XTTS one multilingual model (~2 GB). Both are idempotent — the HF cache and Coqui's ModelManager
+    # (~5 GB), XTTS one multilingual model (~2 GB), MOSS two small repos (~312 MB).
+    # All are idempotent — the HF cache and Coqui's ModelManager
     # skip files that are already in the volume, so a restart costs a few
     # seconds, not a re-download.
     case "$BACKEND" in
         xtts) log "ensuring XTTS-v2 weights in ${F5W_MODELS_DIR:-models} …"
               python -m src.xtts_backend ;;
+        moss) log "ensuring MOSS-TTS-Nano weights in ${F5W_MODELS_DIR:-models} …"
+              python -m src.moss_backend ;;
         *)    log "ensuring F5-TTS weights in ${F5W_MODELS_DIR:-models} …"
               python -m src.models ;;
     esac

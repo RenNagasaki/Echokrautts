@@ -144,6 +144,14 @@ def _default_factory(config: Config) -> WorkerFactory:
 
         return make_xtts
 
+    if config.tts_backend == "moss":
+        def make_moss(worker_id: int, device: str) -> WorkerProtocol:
+            from .moss_backend import MossWorker  # lazy: moss runtime/torch
+
+            return MossWorker(config, device)
+
+        return make_moss
+
     def make(worker_id: int, device: str) -> WorkerProtocol:
         return F5TTSWorker(config, device)
 
@@ -253,6 +261,21 @@ class Engine:
                     worker = await self._build_worker(i, "cpu")
             self._workers.append(worker)
             self._free.put_nowait(worker)
+
+        # A backend may run somewhere other than where it was told to: MOSS
+        # pins itself to the CPU by default, because the GPU buys it nothing and
+        # a game usually wants the card. Report what the workers ACTUALLY use —
+        # `/health` and the `ready` event read this, and until this existed they
+        # announced "device: cuda" while the model ran on the CPU.
+        # `backend` deliberately keeps the detected value: the machine really
+        # does have that GPU, this model just is not using it.
+        effective = getattr(self._workers[0], "device", None) if self._workers else None
+        if effective and effective != self.device:
+            ndjson.log(
+                f"{self._config.tts_backend} läuft auf {effective}, "
+                f"obwohl {self.device} erkannt wurde",
+            )
+            self.device = effective
 
     async def _build_worker(self, worker_id: int, device: str) -> WorkerProtocol:
         assert self._loop is not None

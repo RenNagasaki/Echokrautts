@@ -149,6 +149,14 @@ async function loadMeta() {
   // there is on a card that also runs a game. XTTS ignores the field entirely
   // (it clones from the audio), so the control is disabled rather than quietly
   // doing nothing.
+  // MOSS has no speed parameter — the field is accepted but ignored, so the
+  // control is disabled rather than quietly doing nothing.
+  const speedUsed = health.tts_backend !== "moss";
+  $("speed").disabled = !speedUsed;
+  $("speed").title = speedUsed
+    ? "Playback speed passed to the engine"
+    : "MOSS-TTS-Nano has no speed control — this value is ignored";
+
   const nfeUsed = health.tts_backend === "f5";
   $("nfe").disabled = !nfeUsed;
   $("nfe").title = nfeUsed

@@ -1,3 +1,4 @@
+import asyncio
 import re
 
 import numpy as np
@@ -267,3 +268,48 @@ async def test_inference_error_rebuilds_worker(config):
     # A healthy worker is back in the pool and pending was released.
     assert engine.queue_depth == 0
     assert engine._free.qsize() == 1
+
+
+def test_default_factory_selects_moss(monkeypatch):
+    from src import moss_backend
+
+    class FakeMoss:
+        supports_streaming = True
+
+        def __init__(self, config, device):
+            self.config, self.device = config, device
+
+    monkeypatch.setattr(moss_backend, "MossWorker", FakeMoss)
+    factory = _default_factory(Config(tts_backend="moss"))
+    assert isinstance(factory(0, "cpu"), FakeMoss)
+
+
+def test_health_reports_the_device_the_workers_really_use(config):
+    """A backend may override the engine's choice (MOSS pins itself to the CPU).
+
+    Until the engine read this back, `ready` and `/health` announced "cuda"
+    while the model ran on the CPU — reported live from a real server log.
+    """
+    class CpuPinnedWorker:
+        supports_streaming = False
+        sample_rate = 24000
+        device = "cpu"          # resolved elsewhere than requested
+
+        def __init__(self, worker_id, device):
+            pass
+
+        def self_test(self):
+            return True
+
+    config.tts_backend = "moss"
+    detection = Detection(backend="cuda", device="cuda", torch_index_url="x", detail="test")
+    engine = Engine(
+        config,
+        detection,
+        JobRegistry(),
+        worker_factory=lambda i, d: CpuPinnedWorker(i, d),
+    )
+    asyncio.run(engine.start())
+
+    assert engine.health()["device"] == "cpu", "must report where the model runs"
+    assert engine.health()["backend"] == "cuda", "the machine still has that GPU"

@@ -184,6 +184,101 @@ def test_verify_venv_runs_the_f5_check_too(bootstrap, monkeypatch):
     monkeypatch.setattr(bootstrap, "_verify_torch", lambda *a, **k: called.append("torch"))
     monkeypatch.setattr(bootstrap, "_verify_transformers", lambda *a: called.append("transformers"))
     monkeypatch.setattr(bootstrap, "_verify_f5", lambda *a: called.append("f5"))
+    monkeypatch.setattr(bootstrap, "_verify_moss", lambda *a: called.append("moss"))
 
     bootstrap._verify_venv("py", Config(), "2.7.0")
-    assert called == ["torch", "transformers", "f5"]
+    assert called == ["torch", "transformers", "f5", "moss"]
+
+
+# --------------------------------------------------------------------------
+# MOSS-TTS-Nano install shape
+# --------------------------------------------------------------------------
+
+def test_moss_is_pinned_to_a_commit_not_a_branch(bootstrap):
+    """A moving `main` would change what users get with nothing changing here."""
+    package = Config().moss_install["package"]
+    assert package.startswith("https://github.com/OpenMOSS/MOSS-TTS-Nano/archive/")
+    sha = package.rsplit("/", 1)[-1].removesuffix(".tar.gz")
+    assert len(sha) == 40 and all(c in "0123456789abcdef" for c in sha), sha
+
+
+def test_moss_uses_an_archive_not_git(bootstrap):
+    """`git+https://` would need git on the user's machine; a one-click
+    installer on Windows cannot assume that."""
+    assert not Config().moss_install["package"].startswith("git+")
+
+
+def test_moss_is_installed_no_deps_and_never_pins_torch(bootstrap, monkeypatch):
+    """MOSS declares torch==2.7.0; with deps, pip would fetch it from PyPI and
+    replace the CUDA build with a CPU one."""
+    calls = []
+    monkeypatch.setattr(bootstrap, "_run_uv", lambda args, *_: calls.append([str(a) for a in args]))
+    config = Config()
+    bootstrap._install_moss(config, "py", 4, "deps")
+
+    package_cmd = [c for c in calls if "--no-deps" in c][0]
+    assert config.moss_install["package"] in package_cmd
+    assert not any(a.startswith("torch") for c in calls for a in c)
+    assert not any("WeTextProcessing" in a for c in calls for a in c), "pynini has no Windows wheels"
+
+
+def test_moss_install_can_be_switched_off(bootstrap, monkeypatch):
+    monkeypatch.setattr(bootstrap, "_run_uv", lambda *a, **k: pytest.fail("must not install"))
+    bootstrap._install_moss(Config(moss_install={}), "py", 4, "deps")
+
+
+def test_moss_runs_before_the_torch_re_pin(bootstrap, monkeypatch):
+    """Its own torch pin can move torch; the re-pin is what puts it back."""
+    order = []
+    monkeypatch.setattr(bootstrap, "_is_done", lambda *_: False)
+    monkeypatch.setattr(bootstrap, "_mark_done", lambda *_: None)
+    monkeypatch.setattr(bootstrap, "_verify_venv", lambda *a, **k: None)
+    monkeypatch.setattr(bootstrap, "_venv_python", lambda: Path("py"))
+    monkeypatch.setattr(bootstrap, "_uv_path", lambda: Path("uv"))
+    monkeypatch.setattr(bootstrap.procutil, "run", lambda *a, **k: _Proc())
+    monkeypatch.setattr(bootstrap, "_install_moss", lambda *a, **k: order.append("moss"))
+
+    def record(args, *_):
+        if any(str(a).startswith("torch==") for a in args):
+            order.append("torch-pin")
+
+    monkeypatch.setattr(bootstrap, "_run_uv", record)
+    bootstrap.step_deps(Config(), _cpu_detection(bootstrap))
+
+    assert "moss" in order, "moss was never installed"
+    assert "torch-pin" in order[order.index("moss") + 1:], "no re-pin after the moss install"
+
+
+def test_verify_venv_checks_moss_too(bootstrap, monkeypatch):
+    called = []
+    monkeypatch.setattr(bootstrap, "_verify_torch", lambda *a, **k: None)
+    monkeypatch.setattr(bootstrap, "_verify_transformers", lambda *a: None)
+    monkeypatch.setattr(bootstrap, "_verify_f5", lambda *a: None)
+    monkeypatch.setattr(bootstrap, "_verify_moss", lambda *a: called.append("moss"))
+
+    bootstrap._verify_venv("py", Config(), "2.7.0")
+    assert called == ["moss"]
+
+
+def test_verify_moss_imports_the_runtime_module(bootstrap, monkeypatch):
+    """MOSS ships its runtime as a TOP-LEVEL module, not inside its package —
+    importing the package alone would prove nothing."""
+    seen = {}
+
+    def run(cmd, *a, **k):
+        seen["code"] = cmd[-1]
+        return _Proc()
+
+    monkeypatch.setattr(bootstrap.procutil, "run", run)
+    bootstrap._verify_moss("py", Config())
+    assert "moss_tts_nano_runtime" in seen["code"]
+
+
+def test_verify_moss_reports_a_missing_package(bootstrap, monkeypatch):
+    monkeypatch.setattr(
+        bootstrap.procutil, "run",
+        lambda *a, **k: _Proc(1, stderr="ModuleNotFoundError: No module named 'moss_tts_nano_runtime'"),
+    )
+    with pytest.raises(bootstrap.FatalError) as err:
+        bootstrap._verify_moss("py", Config())
+    assert "moss_tts_nano_runtime" in str(err.value)

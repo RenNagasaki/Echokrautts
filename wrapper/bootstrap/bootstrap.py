@@ -368,6 +368,11 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
         index, step,
     )
 
+    # MOSS goes in BEFORE the re-pin below, on purpose: it declares
+    # `torch==2.7.0` itself and its curated deps can move torch, and the re-pin
+    # is what puts it back. Installed after, any drift would survive.
+    _install_moss(config, py, index, step)
+
     # The project deps (f5-tts, or coqui-tts for XTTS) can win the torch
     # resolution and pull a build that re-introduces the FFmpeg requirement via
     # `torchcodec` (unused — audio loads via torchaudio.load → soundfile on the
@@ -405,6 +410,59 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
     ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten installiert", done=True)
 
 
+def _install_moss(config, py: str, index: int, step: str) -> None:
+    """Install the MOSS-TTS-Nano engine from a pinned source archive.
+
+    Three deliberate choices, each of which would otherwise bite:
+
+    * **A GitHub archive URL, not ``git+https://``.** MOSS publishes no PyPI
+      package, and the git form would need git installed on the user's machine —
+      which a one-click installer cannot assume on Windows.
+    * **A COMMIT, not a branch.** A moving ``main`` would change what users get
+      without a single line changing in this repo.
+    * **``--no-deps``.** MOSS declares ``torch==2.7.0``; installed with deps, pip
+      would fetch that from PyPI and replace the CUDA/ROCm build with a CPU one.
+      The re-pin that follows in :func:`step_deps` owns torch. Its other
+      dependencies are already in this venv, so only the genuinely missing ones
+      are listed in ``config.moss_install["deps"]``.
+
+    ``WeTextProcessing`` from MOSS's requirements.txt is deliberately NOT
+    installed: it needs ``pynini``, which has no Windows wheels, and it is
+    optional — the import is lazy and there are only zh/en normalizers anyway.
+    """
+    spec = config.moss_install or {}
+    package = spec.get("package")
+    if not package:  # explicitly disabled by config → engine simply unavailable
+        return
+    ndjson.progress(index, TOTAL_STEPS, step, "Installiere MOSS-TTS-Nano …", percent=65)
+    _run_uv(["pip", "install", "--python", py, "--no-deps", str(package)], index, step)
+    deps = [str(d) for d in (spec.get("deps") or [])]
+    if deps:
+        _run_uv(["pip", "install", "--python", py, *deps], index, step)
+
+
+def _verify_moss(py: str, config) -> None:
+    """Assert the MOSS runtime imports — before ``deps.done`` is written.
+
+    Because the install is ``--no-deps``, a missing package does not fail the
+    install; it fails the first time somebody selects the backend, long after the
+    install "worked". The import checked here is the top-level module the worker
+    actually loads, not the package name — MOSS ships its runtime as a top-level
+    module rather than inside its package, so importing the package alone would
+    prove nothing.
+    """
+    if not (config.moss_install or {}).get("package"):
+        return
+    proc = procutil.run([py, "-c", "from moss_tts_nano_runtime import NanoTTSService"])
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+        raise FatalError(
+            "moss verification failed: " + " | ".join(tail) + ". "
+            "Check config.moss_install (it installs --no-deps on purpose); "
+            "delete .venv and .state/deps.done and rerun."
+        )
+
+
 def _verify_venv(py: str, config, torch_version: str) -> None:
     """Run every install assertion against an existing venv.
 
@@ -421,6 +479,7 @@ def _verify_venv(py: str, config, torch_version: str) -> None:
     _verify_torch(py, config, expected_version=torch_version)
     _verify_transformers(py)
     _verify_f5(py)
+    _verify_moss(py, config)
 
 
 def _verify_f5(py: str) -> None:
@@ -537,6 +596,7 @@ def step_model(config) -> None:
     # Download the weights for ALL engines (chosen at start, not install):
     #   F5   → every language's checkpoint (en/de/fr/ja), SPEC §14.3.
     #   XTTS → the one multilingual XTTS-v2 model.
+    #   MOSS → the tiny multilingual model + its separate audio tokenizer.
     env = _server_env(config)
     # Let the download sub-processes emit their per-file progress bars onto THIS
     # same "Step 5/6 · model" bar (src.progress.ModelProgress reads these).
@@ -550,6 +610,10 @@ def step_model(config) -> None:
     rc = _popen_forward([str(_venv_python()), "-m", "src.xtts_backend"], env)
     if rc != 0:
         raise FatalError("XTTS-Modell-Download fehlgeschlagen (siehe stderr/Log)")
+    ndjson.progress(index, TOTAL_STEPS, step, "Lade MOSS-TTS-Nano-Modell …", percent=70)
+    rc = _popen_forward([str(_venv_python()), "-m", "src.moss_backend"], env)
+    if rc != 0:
+        raise FatalError("MOSS-Modell-Download fehlgeschlagen (siehe stderr/Log)")
     # Voices, not weights — and deliberately NOT fatal: a failed voice pack means
     # "no voices yet", which the user can fix by dropping in a wav. It must never
     # keep an otherwise working install from starting, so a non-zero exit only

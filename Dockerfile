@@ -33,6 +33,12 @@ ARG TRANSFORMERS_CONSTRAINT=transformers>=4.57,<5
 # first `import f5_tts.api` dies with an AttributeError naming neither package.
 # See config.datasets_constraint (keep both in sync).
 ARG DATASETS_CONSTRAINT=datasets>=3.0
+# MOSS-TTS-Nano: no PyPI package, so a PINNED source archive (a commit, not a
+# branch). --no-deps because it declares torch==2.7.0, which pip would fetch
+# from PyPI and use to replace the CUDA/ROCm build. Keep in sync with
+# config.moss_install.
+ARG MOSS_PACKAGE=https://github.com/OpenMOSS/MOSS-TTS-Nano/archive/8b7bcc9341b3b4ef3a3a58ba1338a7d85ff133eb.tar.gz
+ARG MOSS_DEPS="sentencepiece"
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -54,13 +60,17 @@ COPY wrapper/src /src/wrapper/src
 #   2. BOTH engines in a SINGLE resolution (f5-tts via the wrapper project +
 #      coqui-tts) with the transformers pin in the same resolve, so pip finds
 #      one mutually compatible set instead of two installs stomping each other
-#   3. re-pin torch — the engine deps can win the resolution and drag in a
+#   3. MOSS-TTS-Nano from a pinned archive with --no-deps, BEFORE the re-pin:
+#      it declares its own torch and would otherwise leave a CPU build behind
+#   4. re-pin torch — the engine deps can win the resolution and drag in a
 #      newer torch that requires torchcodec (→ system FFmpeg)
-#   4. drop the unused torchcodec (f5-tts declares it but only calls
+#   5. drop the unused torchcodec (f5-tts declares it but only calls
 #      torchaudio.load, which uses the bundled soundfile backend on 2.7.x)
 RUN pip install "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" \
         --index-url "${TORCH_INDEX_URL}" \
  && pip install /src/wrapper coqui-tts "${TRANSFORMERS_CONSTRAINT}" "${DATASETS_CONSTRAINT}" \
+ && pip install --no-deps "${MOSS_PACKAGE}" \
+ && pip install ${MOSS_DEPS} \
  && pip install "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" \
         --index-url "${TORCH_INDEX_URL}" \
  && pip uninstall -y torchcodec || true
@@ -77,7 +87,8 @@ if u.find_spec("torchcodec") is not None:
     sys.exit("torch verification failed: torchcodec is present (would require system FFmpeg)")
 from transformers.pytorch_utils import isin_mps_friendly  # noqa: F401 — XTTS needs it (gone in transformers 5.x)
 import f5_tts.api  # noqa: F401 — catches a rotten datasets/pyarrow resolution (reported live)
-print(f"ok: torch {torch.__version__}, no torchcodec, transformers pin holds, f5 loads")
+from moss_tts_nano_runtime import NanoTTSService  # noqa: F401 — the --no-deps install must still import
+print(f"ok: torch {torch.__version__}, no torchcodec, transformers pin holds, f5 + moss load")
 PY
 
 # ------------------------------------------------------------------ runtime
@@ -97,7 +108,7 @@ ARG VARIANT=cuda
 ARG GPU_BACKEND=auto
 
 LABEL org.opencontainers.image.title="Echokrautts" \
-      org.opencontainers.image.description="Streaming voice-cloning TTS wrapper (F5-TTS + XTTS-v2) with an HTTP API" \
+      org.opencontainers.image.description="Streaming voice-cloning TTS wrapper (F5-TTS + XTTS-v2 + MOSS-TTS-Nano) with an HTTP API" \
       org.opencontainers.image.source="https://github.com/RenNagasaki/Echokrautts" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${ECHOKRAUTTS_VERSION}"

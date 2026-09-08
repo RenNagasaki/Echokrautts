@@ -17,9 +17,9 @@ longer exists.)
 
 ## One-Click-Starter (Repo-Root)
 - **Pro Backend ein Starter-Paar** im Repo-Root, manuelle 1-Klick-Launcher: `start-f5tts.bat`/
-  `start-f5tts.sh` (F5-TTS) und `start-xtts.bat`/`start-xtts.sh` (XTTS-v2). Der einzige Unterschied
-  ist das durchgereichte `--tts-backend f5` bzw. `xtts` — der Bootstrap installiert eh
-  BEIDE Engines + alle Weights, der Starter wählt nur, welche der Worker-Pool beim Start lädt
+  `start-f5tts.sh` (F5-TTS), `start-xtts.bat`/`start-xtts.sh` (XTTS-v2) und `start-moss.bat`/
+  `start-moss.sh` (MOSS-TTS-Nano). Der einzige Unterschied ist das durchgereichte `--tts-backend f5`
+  bzw. `xtts` bzw. `moss` — der Bootstrap installiert eh ALLE Engines + alle Weights, der Starter wählt nur, welche der Worker-Pool beim Start lädt
   (Umschalten = Neustart, kein Reinstall). Sie rufen die jeweiligen `wrapper/bootstrap/install_*`-
   Starter mit `--start --tts-backend <…>` auf (uv holen → installieren → servieren) und reichen
   Extra-Args durch (z.B. `--language en`). Die `.bat`-Varianten laufen in sichtbarem Fenster mit
@@ -78,6 +78,44 @@ longer exists.)
   on the RTX 5090 against the user's custom XTTS model: streaming + one-shot produce audio, no NaN,
   same level (peak 0.62 vs 0.67, rms 0.1264 vs 0.1269), rtf 0.633 (fp32) → 0.448 (fp16), ~1.4×. `engine.health()` reports the effective `xtts_fp16` (backend==xtts AND flag
   AND device==cuda).
+- `src/moss_backend.py` — **MOSS-TTS-Nano (OpenMOSS, 0.1B), das DRITTE Backend (2026-09-08).**
+  `MossWorker`: gleicher Kontrakt (float32 @ 24000 Hz), klont aus Audio OHNE Transkript (wie XTTS),
+  **`supports_streaming = True`** mit echtem `infer_stream`.
+  - **Warum es die anderen schlägt, LIVE gemessen (RTX 5090, vor dem Bauen):** **CPU ist genauso
+    schnell wie die GPU** (rtf 1,25 gegen 1,22) ⇒ **`moss_device` steht per Default auf `"cpu"`** und
+    lässt die Grafikkarte beim Spiel, was das eigentliche Ziel war. `"auto"` als Default wäre falsch
+    gewesen: es hätte still die GPU genommen, also genau das, wogegen dieses Backend antritt · **erster Ton nach 0,12 s (GPU) / 0,45 s (CPU)** gegen ~2,4 s
+    bei XTTS · **Apache-2.0 für Code UND Gewichte** (einzige Engine ohne NC-Beschränkung) ·
+    **312 MB** gegen F5 ~5 GB / XTTS ~2 GB · 19 Sprachen inkl. aller vier Client-Sprachen.
+  - ⚠ **Klangurteil des Users (2026-09-08, nach dem ersten echten Einsatz): „Klappt gut. Klingt
+    erwartbarerweise jetzt nicht so prickelnd, ist aber für die mit schlechten PCs besser als gar
+    nichts.“** → **MOSS ist die Option für schwache Rechner, NICHT der Qualitätssieger.** Wer die GPU
+    übrig hat, nimmt XTTS. Ein 0,1B-Modell klingt wie ein 0,1B-Modell; sein Wert ist, überhaupt
+    benutzbar zu sein, wenn die Karte dem Spiel gehört. Steht auch im README, damit niemand MOSS als
+    Standard vorschlägt.
+  - ⚠ **Ehrliche Grenze: rtf ~1,25 ist LANGSAMER als Echtzeit.** Bei kurzen Spielzeilen verdeckt das
+    Streaming es; ein langer Satz wird eingeholt. F5 (0,32) und XTTS (0,44) sind in der Summe
+    schneller, aber langsamer zum ersten Ton.
+  - **Verzeichnisnamen mit UNTERSTRICH, nicht Bindestrich** (`models/moss_tts_nano`): MOSS liefert
+    seinen Modellcode mit (`trust_remote_code`), transformers macht aus dem Verzeichnisnamen einen
+    Modulnamen, und ein Bindestrich wird wörtlich zu `_hyphen_` — der erzeugte Code importiert sich
+    dann selbst unter einem Namen, den es nicht gibt. Live beim ersten Laden aufgeschlagen.
+  - **`_use_models_cache()` läuft VOR dem Import der Runtime**, nicht danach: transformers legt seine
+    Cache-Pfade beim IMPORT fest. Zu spät gesetzt landete der Modellcode im maschinenweiten Cache
+    (live: `G:\cache`). Gesetzt werden `HF_HOME`, `HF_HUB_CACHE` **und `HF_MODULES_CACHE`** —
+    letzteres ist der separate Cache für `trust_remote_code`-Code.
+  - **Die Runtime schreibt JEDE Generierung als Datei** und bietet keinen Schalter dagegen. Der
+    Worker legt sie deshalb in ein eigenes `models/moss-scratch/` und löscht sie nach jedem Request
+    (`_cleanup`, nie fatal) — sonst wächst die Platte bei tausenden Spielzeilen unbegrenzt.
+  - **48 kHz stereo → 24 kHz mono** je Chunk in `_to_contract` (torchaudio, schon gepinnt).
+    Durchreichen wäre nicht laut kaputt, sondern still falsch: Stereo als Mono klingt wie Müll,
+    48 kHz als 24 kHz spielt mit halber Geschwindigkeit.
+  - **Installation: gepinntes GitHub-ARCHIV, kein `git+https://`** (pip bräuchte sonst git auf dem
+    Nutzerrechner) und **ein COMMIT, kein Branch**. `--no-deps`, weil MOSS `torch==2.7.0` deklariert
+    und pip es sonst von PyPI holt und die CUDA-Build ersetzt. **`WeTextProcessing` wird bewusst
+    weggelassen** — es hängt an `pynini` (keine Windows-Wheels), ist lazy importiert, optional, und
+    normalisiert ohnehin nur zh/en. `_verify_moss` importiert `moss_tts_nano_runtime` (TOP-LEVEL-Modul,
+    nicht das Paket!) vor `deps.done`.
 - `src/audio_compat.py` — `ensure_native_audio_loading()`: replaces `torchaudio.load` with a
   soundfile-based implementation **iff** torchaudio ≥ 2.9 AND torchcodec is absent (`_needs_shim` is
   pure → unit-testable without torch). Exists for exactly one backend: AMD's native-Windows ROCm
@@ -356,8 +394,8 @@ longer exists.)
   Sonderfälle in `_request_languages`/`BACKEND_NAMES` (Chinesisch `zh` vs. XTTS `zh-cn`).
 
 ## Multi-backend (install all engines, select one at start)
-- **Install-all / select-at-start:** the bootstrap installs BOTH engines and ALL their weights
-  into the single `.venv`/`models`. `--tts-backend <f5|xtts>` (config `tts_backend`, default `f5`) only
+- **Install-all / select-at-start:** the bootstrap installs ALL THREE engines and ALL their weights
+  into the single `.venv`/`models`. `--tts-backend <f5|xtts|moss>` (config `tts_backend`, default `f5`) only
   selects which engine the worker pool loads at startup — **switching is a restart, never a
   reinstall.** `_default_factory` in `engine.py` picks `F5TTSWorker` vs `XTTSWorker` (XTTS imported
   lazily). Bootstrap forwards the choice via `F5W_TTS_BACKEND`; `/health` reports `tts_backend`.

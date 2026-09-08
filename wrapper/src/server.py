@@ -61,17 +61,20 @@ class TtsRequest(BaseModel):
 
 
 # Display names of the backends for user-facing messages.
-BACKEND_NAMES = {"f5": "F5-TTS", "xtts": "XTTS"}
+BACKEND_NAMES = {"f5": "F5-TTS", "xtts": "XTTS", "moss": "MOSS-TTS-Nano"}
 
 
 def _request_languages(config: Config) -> Optional[frozenset]:
     """Languages the ACTIVE backend accepts per request, or ``None`` when it is
     locked to the model loaded at startup.
 
-    XTTS is multilingual in ONE model, so a per-request language just selects
-    the target — no reload, no cost. F5 loads one finetune per process and can
-    only voice that language. The import is lazy so this module stays importable
-    without the engine installed.
+    XTTS and MOSS are multilingual in ONE model, so a per-request language just
+    selects the target — no reload, no cost. (MOSS goes further and infers the
+    language from the text itself; the set is still validated, so a request for
+    something it was never trained on fails cleanly instead of returning
+    confident nonsense.) F5 loads one finetune per process and can only voice
+    that language. The imports are lazy so this module stays importable without
+    the engines installed.
 
     Deliberately a lookup and not an ``if`` chain per backend: a further
     multilingual engine is one entry here, not a second branch in
@@ -81,6 +84,10 @@ def _request_languages(config: Config) -> Optional[frozenset]:
         from .xtts_backend import XTTS_LANGUAGES
 
         return XTTS_LANGUAGES
+    if config.tts_backend == "moss":
+        from .moss_backend import MOSS_LANGUAGES
+
+        return MOSS_LANGUAGES
     return None
 
 

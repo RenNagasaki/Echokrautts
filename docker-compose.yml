@@ -21,7 +21,9 @@ services:
     environment:
       # Engine choice is a restart, never a reinstall — both engines are in the
       # image. "xtts" clones from audio alone (no transcript) and is
-      # multilingual per request; "f5" loads ONE language finetune per process.
+      # multilingual per request; "f5" loads ONE language finetune per process;
+      # "moss" is multilingual AND streams, needs no transcript, and is small
+      # enough to run on the CPU (F5W_MOSS_DEVICE=cpu) so the GPU stays free.
       F5W_TTS_BACKEND: "${F5W_TTS_BACKEND:-xtts}"
       F5W_LANGUAGE: "${F5W_LANGUAGE:-de}"
       # Half precision — only takes effect on CUDA, ~1.4x faster on XTTS.
