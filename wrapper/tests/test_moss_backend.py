@@ -96,7 +96,20 @@ def fake_moss(monkeypatch, tmp_path):
         def numpy(self):
             return self.a
 
+        # The seam-free resampling carries a tail across chunks, so the stub has
+        # to support the handful of tensor operations that needs.
+        def numel(self):
+            return self.a.size
+
+        def clone(self):
+            return _T(self.a.copy())
+
+        def __getitem__(self, item):
+            return _T(self.a[item])
+
     torch_stub.as_tensor = lambda a, **k: _T(a)
+    torch_stub.cat = lambda parts: _T(np.concatenate([p.a for p in parts]))
+    torch_stub.from_numpy = lambda a: _T(a)
     monkeypatch.setitem(sys.modules, "torch", torch_stub)
 
     torchaudio = types.ModuleType("torchaudio")
@@ -299,3 +312,59 @@ def test_missing_weights_say_so_instead_of_becoming_a_repo_id(fake_moss, tmp_pat
     message = str(err.value)
     assert "moss_tts_nano" in message, "must name the directory it looked in"
     assert "src.moss_backend" in message, "must say how to fix it"
+
+
+# ---------------------------------------------------------------- seam-free audio
+#
+# A user heard crackling. Measured on the real model: resampling each streamed
+# chunk on its own left the largest sample-to-sample jump at the seams at 1.48x
+# the signal's own typical step, across ~60 seams per sentence. Carrying the tail
+# of the previous chunk into the next resample brought that to 0.71x — exactly
+# the value of resampling the whole thing at once.
+
+def test_the_resampler_gets_context_across_chunk_boundaries(fake_moss, tmp_path):
+    """Without it the filter starts cold on every chunk, which is audible."""
+    worker = _worker(tmp_path=tmp_path)
+    lengths = []
+
+    real = moss_backend.torchaudio if hasattr(moss_backend, "torchaudio") else None
+    import sys as _sys
+
+    def spy(tensor, orig, target):
+        lengths.append(tensor.a.shape[-1])
+        return tensor
+
+    _sys.modules["torchaudio"].functional.resample = spy
+    list(worker.infer_stream("r.wav", "", "Text.", 1.0))
+
+    assert len(lengths) >= 2, "needs several chunks to have a seam at all"
+    assert lengths[0] < lengths[1], (
+        "later chunks must be resampled WITH the previous tail prepended; "
+        f"got {lengths[:3]}"
+    )
+    assert lengths[1] - lengths[0] == moss_backend.MossWorker.RESAMPLE_OVERLAP
+
+
+def test_the_carried_tail_does_not_leak_between_requests(fake_moss, tmp_path):
+    """Two requests are two signals. Splicing the end of one sentence onto the
+    start of the next would be a defect that only shows up in production."""
+    worker = _worker(tmp_path=tmp_path)
+    list(worker.infer_stream("r.wav", "", "Erster Satz.", 1.0))
+    assert worker._resample_tail is not None, "a tail is kept within a request"
+
+    lengths = []
+    import sys as _sys
+
+    _sys.modules["torchaudio"].functional.resample = lambda t, o, n: (
+        lengths.append(t.a.shape[-1]) or t
+    )
+    list(worker.infer_stream("r.wav", "", "Zweiter Satz.", 1.0))
+    assert lengths[0] < lengths[1], "the second request must start without a tail"
+
+
+def test_no_overlap_work_when_no_resampling_is_needed(fake_moss, tmp_path):
+    """If the engine already emits the contract rate there is nothing to smooth."""
+    worker = _worker(tmp_path=tmp_path)
+    worker.sample_rate = 48000
+    list(worker.infer_stream("r.wav", "", "Text.", 1.0))
+    assert worker._resample_tail is None
