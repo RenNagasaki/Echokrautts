@@ -104,7 +104,7 @@ def test_engine_install_carries_the_datasets_constraint(bootstrap, monkeypatch):
 def test_healthy_existing_venv_is_skipped_not_rebuilt(bootstrap, monkeypatch):
     """The repair must not turn every rerun into a reinstall."""
     monkeypatch.setattr(bootstrap, "_is_done", lambda *_: True)
-    monkeypatch.setattr(bootstrap, "_existing_venv_problem", lambda *a: None)
+    monkeypatch.setattr(bootstrap, "_existing_venv_problem", lambda *a: (None, False))
     cleared, ran = [], []
     monkeypatch.setattr(bootstrap, "_clear_done", lambda name: cleared.append(name))
     monkeypatch.setattr(bootstrap, "_run_uv", lambda args, *_: ran.append(args))
@@ -118,7 +118,7 @@ def test_healthy_existing_venv_is_skipped_not_rebuilt(bootstrap, monkeypatch):
 def test_broken_existing_venv_drops_the_marker_and_reinstalls(bootstrap, monkeypatch):
     """Exactly the reported case: marker present, venv unusable."""
     monkeypatch.setattr(bootstrap, "_is_done", lambda *_: True)
-    monkeypatch.setattr(bootstrap, "_existing_venv_problem", lambda *a: "f5-tts kaputt")
+    monkeypatch.setattr(bootstrap, "_existing_venv_problem", lambda *a: ("torch kaputt", False))
     cleared, ran = [], []
     monkeypatch.setattr(bootstrap, "_clear_done", lambda name: cleared.append(name))
     monkeypatch.setattr(bootstrap, "_run_uv", lambda args, *_: ran.append(args))
@@ -143,15 +143,15 @@ def test_venv_problem_reports_instead_of_raising(bootstrap, monkeypatch, tmp_pat
     def boom(*_a, **_k):
         raise bootstrap.FatalError("f5-tts verification failed: pyarrow. Delete .venv")
 
-    monkeypatch.setattr(bootstrap, "_verify_venv", boom)
-    problem = bootstrap._existing_venv_problem(Config(), "2.7.0")
+    monkeypatch.setattr(bootstrap, "_verify_torch", boom)
+    problem, repairable = bootstrap._existing_venv_problem(Config(), "2.7.0")
     assert problem is not None
     assert "f5-tts" in problem
 
 
 def test_missing_venv_is_a_problem_even_with_the_marker(bootstrap, monkeypatch, tmp_path):
     monkeypatch.setattr(bootstrap, "_venv_python", lambda: tmp_path / "gone" / "python.exe")
-    assert bootstrap._existing_venv_problem(Config(), "2.7.0") == "venv fehlt"
+    assert bootstrap._existing_venv_problem(Config(), "2.7.0") == ("venv fehlt", False)
 
 
 # --------------------------------------------------------------------------
@@ -282,3 +282,117 @@ def test_verify_moss_reports_a_missing_package(bootstrap, monkeypatch):
     with pytest.raises(bootstrap.FatalError) as err:
         bootstrap._verify_moss("py", Config())
     assert "moss_tts_nano_runtime" in str(err.value)
+
+
+# --------------------------------------------------------------------------
+# Upgrading an existing install
+#
+# All of this comes from one real 0.0.1.0 upgrade that failed: the installed
+# venv simply lacked the newly added engine, the marker repair decided to
+# rebuild, and `uv venv --clear` died with "Zugriff verweigert (os error 5)" on
+# .venv\Scripts — leaving the install broken rather than merely un-upgraded.
+# --------------------------------------------------------------------------
+
+def test_a_missing_engine_is_repaired_in_place(bootstrap, monkeypatch):
+    """The ordinary upgrade must not cost a multi-gigabyte torch download.
+
+    torch and transformers verified fine; only an engine package was absent.
+    Rebuilding would throw away a working foundation to add 14 MB.
+    """
+    monkeypatch.setattr(bootstrap, "_verify_torch", lambda *a, **k: None)
+    monkeypatch.setattr(bootstrap, "_verify_transformers", lambda *a: None)
+    monkeypatch.setattr(bootstrap, "_verify_f5", lambda *a: None)
+
+    def missing_moss(*_a, **_k):
+        raise bootstrap.FatalError("moss verification failed: No module named 'moss_tts_nano_runtime'")
+
+    monkeypatch.setattr(bootstrap, "_verify_moss", missing_moss)
+    monkeypatch.setattr(bootstrap, "_venv_python", lambda: Path(__file__))  # exists
+
+    problem, repairable = bootstrap._existing_venv_problem(Config(), "2.7.0")
+    assert problem and repairable is True
+
+
+def test_a_wrong_torch_still_forces_a_rebuild(bootstrap, monkeypatch):
+    """The foundation cannot be patched over: no amount of installing fixes a
+    venv whose torch is the wrong build."""
+    def bad_torch(*_a, **_k):
+        raise bootstrap.FatalError("torch verification failed: installed 2.4.1")
+
+    monkeypatch.setattr(bootstrap, "_verify_torch", bad_torch)
+    monkeypatch.setattr(bootstrap, "_venv_python", lambda: Path(__file__))
+
+    problem, repairable = bootstrap._existing_venv_problem(Config(), "2.7.0")
+    assert problem and repairable is False
+
+
+def test_repair_installs_without_recreating_the_venv(bootstrap, monkeypatch):
+    """The venv must NOT be deleted — that is what collided with the server."""
+    monkeypatch.setattr(bootstrap, "_is_done", lambda *_: True)
+    monkeypatch.setattr(bootstrap, "_existing_venv_problem", lambda *a: ("moss fehlt", True))
+    monkeypatch.setattr(bootstrap, "_venv_python", lambda: Path("py"))
+    monkeypatch.setattr(bootstrap, "_verify_venv", lambda *a, **k: None)
+    monkeypatch.setattr(bootstrap, "_mark_done", lambda *_: None)
+    created, installed = [], []
+    monkeypatch.setattr(bootstrap, "_create_venv", lambda *a, **k: created.append(a))
+    monkeypatch.setattr(bootstrap, "_install_engines", lambda *a, **k: installed.append(a))
+    monkeypatch.setattr(bootstrap, "_clear_done", lambda *_: pytest.fail("marker must be kept"))
+
+    bootstrap.step_deps(Config(), _cpu_detection(bootstrap))
+
+    assert created == [], "the venv must not be recreated for a missing engine"
+    assert installed, "the engines were never installed"
+
+
+def test_a_locked_venv_directory_is_retried(bootstrap, monkeypatch):
+    """Windows cannot delete a directory whose files are open, and the likely
+    holder is the server that stopped a second ago."""
+    calls = []
+
+    def flaky(args, *_a, **_k):
+        calls.append(args)
+        if len(calls) < 3:
+            raise bootstrap.FatalError(
+                "uv venv failed: failed to remove directory `.venv/Scripts`: "
+                "Zugriff verweigert (os error 5)"
+            )
+
+    monkeypatch.setattr(bootstrap, "_run_uv", flaky)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(bootstrap.ndjson, "progress", lambda *a, **k: None)
+
+    bootstrap._create_venv("3.11", 4, "deps")
+    assert len(calls) == 3, "it must keep trying while the handle is released"
+
+
+def test_a_permanently_locked_venv_says_what_to_do(bootstrap, monkeypatch):
+    """After the retries, the message has to be actionable — the original just
+    quoted an errno, which tells a user nothing."""
+    def always_locked(*_a, **_k):
+        raise bootstrap.FatalError("failed to remove directory: Zugriff verweigert (os error 5)")
+
+    monkeypatch.setattr(bootstrap, "_run_uv", always_locked)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(bootstrap.ndjson, "progress", lambda *a, **k: None)
+
+    with pytest.raises(bootstrap.FatalError) as err:
+        bootstrap._create_venv("3.11", 4, "deps", attempts=2)
+    message = str(err.value)
+    assert "Server" in message, "must name the likely cause"
+    assert "os error 5" in message, "must keep the original error"
+
+
+def test_an_unrelated_venv_failure_is_not_retried(bootstrap, monkeypatch):
+    """Retrying something that is not a lock just delays the real error."""
+    calls = []
+
+    def broken(args, *_a, **_k):
+        calls.append(args)
+        raise bootstrap.FatalError("uv venv failed: no such python version")
+
+    monkeypatch.setattr(bootstrap, "_run_uv", broken)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: pytest.fail("must not wait"))
+
+    with pytest.raises(bootstrap.FatalError):
+        bootstrap._create_venv("3.11", 4, "deps")
+    assert len(calls) == 1

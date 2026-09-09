@@ -174,6 +174,21 @@ longer exists.)
   treating `rocm_win` as **fragile** (worker build wrapped in try/except AND self-tested, rebuild on
   CPU with a warning, never a dead server). All four URL/version fields live in `config.json` under
   `rocm_windows`, so an AMD release bump is a data edit. All seven URLs verified 200 on 2026-08-07.
+- **Ein fehlendes ENGINE-Paket wird nachinstalliert, NICHT mit einem venv-Neubau beantwortet
+  (2026-09-10, aus einem echten gescheiterten Upgrade).** `_existing_venv_problem` gibt seither
+  `(Grund, reparierbar)` zurück: falsches torch/transformers ⇒ Neubau (die Grundlage lässt sich nicht
+  flicken), fehlende Engine ⇒ `_install_engines` in das VORHANDENE venv, Marker bleibt. Der erste
+  0.0.1.0-Upgrade scheiterte genau hier: das Alt-venv hatte kein MOSS, die Reparatur wollte neu bauen,
+  und `uv venv --clear` starb an `Zugriff verweigert (os error 5)` auf `.venv\Scripts` — **mit bereits
+  gelöschtem site-packages, also einer kaputten Installation.** Ein 14-MB-Paket hätte gereicht.
+- **`_create_venv` wiederholt bei gesperrtem Verzeichnis** (5 Versuche, wachsende Pause). Unter Windows
+  lässt sich ein Verzeichnis nicht entfernen, solange eine Datei darin offen ist — und die
+  wahrscheinlichsten Halter sind der Server, der eine Sekunde vorher lief, und die
+  Verifikations-Subprozesse dieses Schritts selbst. Bleibt es gesperrt, nennt die Meldung die Ursache
+  und was zu tun ist, statt eine errno zu zitieren.
+- **`_install_engines` ist die gemeinsame Installationsfolge** für Neubau UND Reparatur. Die
+  Reihenfolge darin ist tragend (Engines VOR dem Torch-Re-Pin); eine zweite Kopie wäre beim ersten
+  Anfassen auseinandergelaufen.
 - **Ein Marker heißt „fertig installiert", NICHT „funktioniert noch" (2026-09-07).** `step_deps`
   ruft bei gesetztem `deps.done` erst `_existing_venv_problem` → `_verify_venv` (torch, transformers,
   **f5-tts-Import**) gegen das VORHANDENE venv; nur ein sauberes Ergebnis überspringt den

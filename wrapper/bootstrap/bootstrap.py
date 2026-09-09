@@ -24,6 +24,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import tarfile
 import urllib.request
 import zipfile
@@ -146,22 +147,41 @@ def _clear_done(name: str) -> None:
     _marker(name).unlink(missing_ok=True)
 
 
-def _existing_venv_problem(config, torch_version: str) -> str | None:
-    """Why the already-installed venv cannot be used, or None if it is fine.
+def _existing_venv_problem(config, torch_version: str) -> tuple[str | None, bool]:
+    """(what is wrong with the installed venv, can it be repaired in place?).
 
-    Never raises: every failure mode here means "reinstall", so a surprise from
-    the probe itself must not abort the bootstrap that would have repaired it.
+    Returns ``(None, False)`` when it is fine. The second flag is the important
+    part and was learned from a real upgrade: a venv whose **torch** is wrong has
+    to be rebuilt, but one that merely LACKS AN ENGINE does not — installing the
+    missing package costs a few megabytes where a rebuild costs a multi-gigabyte
+    torch download, and it does not have to delete a directory that a
+    just-stopped server may still hold open.
+
+    Never raises: every failure mode here means "fix it", so a surprise from the
+    probe itself must not abort the bootstrap that would have done the fixing.
     """
     py = _venv_python()
     if not py.exists():
-        return "venv fehlt"
+        return "venv fehlt", False
     try:
-        _verify_venv(str(py), config, torch_version)
+        # The foundation. Wrong torch (or a torchcodec that drags FFmpeg back in)
+        # cannot be patched over — that venv has to go.
+        _verify_torch(str(py), config, expected_version=torch_version)
+        _verify_transformers(str(py))
     except FatalError as exc:
-        return str(exc).split(".")[0]
+        return str(exc).split(".")[0], False
     except OSError as exc:  # venv present but unusable (permissions, half-deleted)
-        return f"venv nicht ausführbar: {exc}"
-    return None
+        return f"venv nicht ausführbar: {exc}", False
+    try:
+        # The engines. Missing or broken ones are re-installable in place; this
+        # is the ordinary "upgraded to a version that added an engine" case.
+        _verify_f5(str(py))
+        _verify_moss(str(py), config)
+    except FatalError as exc:
+        return str(exc).split(".")[0], True
+    except OSError as exc:
+        return f"venv nicht ausführbar: {exc}", False
+    return None, False
 
 
 def _mark_done(name: str) -> None:
@@ -291,36 +311,55 @@ def step_detect(config) -> gpu_detect.Detection:
     return det
 
 
-def step_deps(config, det: gpu_detect.Detection) -> None:
-    index, step = 4, "deps"
-    torch_version = det.torch_version or config.torch_version
-    if _is_done(step):
-        problem = _existing_venv_problem(config, torch_version)
-        if problem is None:
-            ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten vorhanden", skipped=True)
-            return
-        # The marker says "installed", the venv says otherwise. Rebuilding is
-        # the only repair the user could perform by hand anyway (the error texts
-        # say as much), and leaving the marker in place would hand the broken
-        # venv to the model step, which then fails somewhere that explains
-        # nothing. Costs a reinstall — but only for an install that is already
-        # unusable, never for a healthy one.
-        ndjson.log(
-            f"Vorhandene Installation unbrauchbar ({problem}) — wird neu gebaut",
-            level="warning",
-        )
-        _clear_done(step)
-    ndjson.progress(index, TOTAL_STEPS, step, "Erstelle venv …")
-    # A backend may demand its own interpreter: AMD's native-Windows ROCm wheels
-    # are cp312-only, while everything else runs on the configured 3.11. uv
-    # fetches a missing Python itself, so this needs no extra step.
-    python_version = det.python_version or config.python_version
-    # --clear: replace any pre-existing .venv (e.g. one an earlier `uv run`
-    # accidentally synced from pyproject) instead of failing "already exists".
-    # We own this venv and install the pinned torch into it below.
-    _run_uv(["venv", str(VENV_DIR), "--clear", "--python", python_version], index, step)
+def _create_venv(python_version: str, index: int, step: str, attempts: int = 5) -> None:
+    r"""Create (or replace) the venv, tolerating a directory Windows still holds.
 
-    py = str(_venv_python())
+    ``--clear`` replaces any pre-existing venv — e.g. one an earlier ``uv run``
+    accidentally synced from pyproject — instead of failing "already exists".
+
+    The retries are not defensive padding. On Windows a directory cannot be
+    removed while any file in it is open, and the two things most likely to hold
+    ``.venv/Scripts/python.exe`` are the server that was running a second ago and
+    the verification subprocesses this very step just ran. A real 0.0.1.0 upgrade
+    died exactly here: ``failed to remove directory .venv\Scripts: Zugriff
+    verweigert (os error 5)`` — and it left the install broken, because the venv
+    was already partly gone. Waiting a few seconds costs nothing when the handle
+    is about to be released, and when it is not, the final message says what to
+    do instead of quoting an errno.
+    """
+    delay = 2.0
+    for attempt in range(1, attempts + 1):
+        try:
+            _run_uv(["venv", str(VENV_DIR), "--clear", "--python", python_version], index, step)
+            return
+        except FatalError as exc:
+            locked = "os error 5" in str(exc) or "Zugriff verweigert" in str(exc)                 or "Access is denied" in str(exc) or "being used by another process" in str(exc)
+            if not locked or attempt == attempts:
+                if locked:
+                    raise FatalError(
+                        "Das venv-Verzeichnis ist gesperrt und konnte nicht ersetzt werden. "
+                        "Meist läuft noch ein EchokrauTTS-Server oder ein Virenscanner hält die "
+                        "Dateien. Beende den laufenden Server (oder starte den Rechner neu) und "
+                        "versuche es erneut. Ursprungsfehler: " + str(exc)
+                    ) from exc
+                raise
+            ndjson.progress(
+                index, TOTAL_STEPS, step,
+                f"venv-Verzeichnis noch gesperrt, neuer Versuch {attempt + 1}/{attempts} …",
+            )
+            time.sleep(delay)
+            delay *= 1.5
+
+
+def _install_engines(config, det, py: str, index: int, step: str) -> None:
+    """Install torch + every engine into an EXISTING venv.
+
+    Split out so the fresh install and the in-place repair run the SAME steps
+    in the same order — the order is load-bearing (engines before the torch
+    re-pin), and a second copy of it would drift the first time somebody
+    touched one of them.
+    """
+    torch_version = det.torch_version or config.torch_version
     torch_pin = f"torch=={torch_version}"
     audio_pin = f"torchaudio=={det.torchaudio_version or config.torchaudio_version}"
 
@@ -404,6 +443,48 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
     # libtorchcodec"). If that slipped past the re-pin/uninstall, fail loudly so
     # ``deps.done`` is NOT written and the next run rebuilds — never freeze a
     # broken venv behind the marker (SPEC §3 idempotency must not cache garbage).
+
+
+def step_deps(config, det: gpu_detect.Detection) -> None:
+    index, step = 4, "deps"
+    torch_version = det.torch_version or config.torch_version
+    if _is_done(step):
+        problem, repairable = _existing_venv_problem(config, torch_version)
+        if problem is None:
+            ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten vorhanden", skipped=True)
+            return
+        if repairable:
+            # The ordinary upgrade: this version added an engine the installed
+            # venv does not have. Its torch is verified good, so the engines are
+            # simply installed into it. Rebuilding here would cost a
+            # multi-gigabyte torch download AND require deleting a directory a
+            # just-stopped server can still be holding open — which is exactly
+            # how the first 0.0.1.0 upgrade failed, with "Zugriff verweigert" on
+            # .venv\Scripts.
+            ndjson.log(f"Installation wird ergänzt ({problem})")
+            _install_engines(config, det, str(_venv_python()), index, step)
+            _verify_venv(str(_venv_python()), config, torch_version)
+            _mark_done(step)
+            ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten ergänzt", done=True)
+            return
+        # The foundation itself is wrong (torch), which no amount of installing
+        # fixes. Leaving the marker would hand the broken venv to the model step,
+        # which then fails somewhere that explains nothing.
+        ndjson.log(
+            f"Vorhandene Installation unbrauchbar ({problem}) — wird neu gebaut",
+            level="warning",
+        )
+        _clear_done(step)
+    ndjson.progress(index, TOTAL_STEPS, step, "Erstelle venv …")
+    # A backend may demand its own interpreter: AMD's native-Windows ROCm wheels
+    # are cp312-only, while everything else runs on the configured 3.11. uv
+    # fetches a missing Python itself, so this needs no extra step.
+    python_version = det.python_version or config.python_version
+    _create_venv(python_version, index, step)
+
+    py = str(_venv_python())
+    _install_engines(config, det, py, index, step)
+
     _verify_venv(py, config, torch_version)
 
     _mark_done(step)
