@@ -111,8 +111,22 @@ def fake_moss(monkeypatch, tmp_path):
     return holder
 
 
+def _lay_down_weights(config) -> None:
+    """Create what the worker now insists on finding.
+
+    The worker refuses to start without the model files, because letting
+    transformers reinterpret a missing path as a repo id produced an error that
+    named neither the cause nor the fix. Tests therefore have to put something
+    there — which is the point: the check is real, not decorative.
+    """
+    for directory in moss_backend._model_dirs(config):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "config.json").write_text("{}", encoding="utf-8")
+
+
 def _worker(config=None, device="cpu", tmp_path=None):
     cfg = config or Config(models_dir=str(tmp_path) if tmp_path else None)
+    _lay_down_weights(cfg)
     return moss_backend.MossWorker(cfg, device)
 
 
@@ -176,12 +190,14 @@ def test_config_can_pin_moss_to_the_cpu(fake_moss, tmp_path):
     """The whole point of this engine: measured, CPU matches the GPU, so the
     graphics card can stay with the game."""
     cfg = Config(models_dir=str(tmp_path), moss_device="cpu")
+    _lay_down_weights(cfg)
     moss_backend.MossWorker(cfg, "cuda")
     assert fake_moss["init"]["device"] == "cpu"
 
 
 def test_auto_follows_the_engine_device(fake_moss, tmp_path):
     cfg = Config(models_dir=str(tmp_path), moss_device="auto")
+    _lay_down_weights(cfg)
     moss_backend.MossWorker(cfg, "cuda")
     assert fake_moss["init"]["device"] == "cuda"
 
@@ -189,6 +205,7 @@ def test_auto_follows_the_engine_device(fake_moss, tmp_path):
 @pytest.mark.parametrize("device", ["dml", "xpu"])
 def test_unsupported_devices_map_to_cpu(fake_moss, tmp_path, device):
     cfg = Config(models_dir=str(tmp_path), moss_device="auto")
+    _lay_down_weights(cfg)
     moss_backend.MossWorker(cfg, device)
     assert fake_moss["init"]["device"] == "cpu"
 
@@ -252,6 +269,7 @@ def test_the_default_keeps_the_gpu_free(fake_moss, tmp_path):
     """
     assert Config().moss_device == "cpu"
     cfg = Config(models_dir=str(tmp_path))
+    _lay_down_weights(cfg)
     moss_backend.MossWorker(cfg, "cuda")
     assert fake_moss["init"]["device"] == "cpu"
 
@@ -264,5 +282,20 @@ def test_worker_reports_the_device_it_actually_uses(fake_moss, tmp_path):
     geladen auf cpu" one line above `"device": "cuda"`.
     """
     cfg = Config(models_dir=str(tmp_path), moss_device="cpu")
+    _lay_down_weights(cfg)
     worker = moss_backend.MossWorker(cfg, "cuda")
     assert worker.device == "cpu"
+
+
+def test_missing_weights_say_so_instead_of_becoming_a_repo_id(fake_moss, tmp_path):
+    """transformers treats a path that is not a directory as a HuggingFace repo
+    id and then fails its name validation — an error that names neither the
+    missing weights nor what to do. Seen live after an upgrade installed the
+    engine but skipped its download."""
+    config = Config(models_dir=str(tmp_path))  # nothing downloaded
+    with pytest.raises(RuntimeError) as err:
+        moss_backend.MossWorker(config, "cpu")
+
+    message = str(err.value)
+    assert "moss_tts_nano" in message, "must name the directory it looked in"
+    assert "src.moss_backend" in message, "must say how to fix it"

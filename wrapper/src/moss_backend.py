@@ -85,6 +85,19 @@ def _resolve_model_dirs(config: Config) -> tuple[str, str]:
         ndjson.log_once(f"Nutze eigenes MOSS-Modell: {custom}")
         return str(custom), str(custom / "audio_tokenizer")
     checkpoint, tokenizer = _model_dirs(config)
+    # Say plainly that the weights are missing. Without this, transformers gets
+    # a path that is not a directory, decides it must be a HuggingFace repo id
+    # instead, and fails validation — "Repo id must use alphanumeric chars […]
+    # 'C:\…\models\moss_tts_nano'", which names neither the real problem nor
+    # the fix. Seen live after an upgrade that installed the engine but skipped
+    # its download.
+    for path in (checkpoint, tokenizer):
+        if not (path / "config.json").is_file():
+            raise RuntimeError(
+                f"MOSS-Modelldateien fehlen in {path}. "
+                "Hole sie mit `python -m src.moss_backend` nach (oder lösche "
+                ".state/model.done und starte neu)."
+            )
     return str(checkpoint), str(tokenizer)
 
 

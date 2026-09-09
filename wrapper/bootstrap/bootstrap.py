@@ -476,6 +476,18 @@ def step_deps(config, det: gpu_detect.Detection) -> None:
             ndjson.log(f"Installation wird ergänzt ({problem})")
             _install_engines(config, det, str(_venv_python()), index, step)
             _verify_venv(str(_venv_python()), config, torch_version)
+            # An engine was just added, so ITS weights cannot be on disk — and
+            # `model.done` is still set from the older install, which would make
+            # step 5 skip and the server then start an engine with no model.
+            # That is exactly how the first repaired upgrade failed: the package
+            # was there, the weights were not, and transformers reinterpreted the
+            # missing local path as a HuggingFace repo id ("Repo id must use
+            # alphanumeric chars ... 'C:\...\models\moss_tts_nano'"). Every
+            # download step is idempotent, so re-running them costs a few HTTP
+            # checks for what is already there.
+            if _is_done("model"):
+                ndjson.log("Modelle werden erneut geprüft (neue Engine hinzugekommen)")
+                _clear_done("model")
             _mark_done(step)
             ndjson.progress(index, TOTAL_STEPS, step, "Abhängigkeiten ergänzt", done=True)
             return

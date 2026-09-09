@@ -336,12 +336,14 @@ def test_repair_installs_without_recreating_the_venv(bootstrap, monkeypatch):
     created, installed = [], []
     monkeypatch.setattr(bootstrap, "_create_venv", lambda *a, **k: created.append(a))
     monkeypatch.setattr(bootstrap, "_install_engines", lambda *a, **k: installed.append(a))
-    monkeypatch.setattr(bootstrap, "_clear_done", lambda *_: pytest.fail("marker must be kept"))
+    cleared = []
+    monkeypatch.setattr(bootstrap, "_clear_done", lambda name: cleared.append(name))
 
     bootstrap.step_deps(Config(), _cpu_detection(bootstrap))
 
     assert created == [], "the venv must not be recreated for a missing engine"
     assert installed, "the engines were never installed"
+    assert "deps" not in cleared, "the deps marker must be kept — the venv is fine"
 
 
 def test_a_locked_venv_directory_is_retried(bootstrap, monkeypatch):
@@ -423,3 +425,37 @@ def test_a_free_directory_costs_no_waiting(bootstrap, monkeypatch):
     monkeypatch.setattr(bootstrap, "_run_uv", lambda *a, **k: None)
     monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: pytest.fail("must not wait"))
     bootstrap._create_venv("3.11", 4, "deps")
+
+
+def test_adding_an_engine_also_re_runs_the_model_step(bootstrap, monkeypatch):
+    """A newly installed engine cannot have its weights on disk yet.
+
+    `model.done` survives from the older install, so without this the download
+    step is skipped and the server starts an engine with no model — which
+    surfaces as transformers reinterpreting the missing path as a repo id
+    ("Repo id must use alphanumeric chars"), naming neither cause nor fix.
+    """
+    cleared = []
+    monkeypatch.setattr(bootstrap, "_is_done", lambda name: True)
+    monkeypatch.setattr(bootstrap, "_existing_venv_problem", lambda *a: ("moss fehlt", True))
+    monkeypatch.setattr(bootstrap, "_venv_python", lambda: Path("py"))
+    monkeypatch.setattr(bootstrap, "_verify_venv", lambda *a, **k: None)
+    monkeypatch.setattr(bootstrap, "_install_engines", lambda *a, **k: None)
+    monkeypatch.setattr(bootstrap, "_mark_done", lambda *_: None)
+    monkeypatch.setattr(bootstrap, "_clear_done", lambda name: cleared.append(name))
+
+    bootstrap.step_deps(Config(), _cpu_detection(bootstrap))
+
+    assert "model" in cleared, "the model step must run again after adding an engine"
+
+
+def test_a_healthy_install_does_not_re_download_models(bootstrap, monkeypatch):
+    """The re-check is for upgrades, not for every start."""
+    cleared = []
+    monkeypatch.setattr(bootstrap, "_is_done", lambda name: True)
+    monkeypatch.setattr(bootstrap, "_existing_venv_problem", lambda *a: (None, False))
+    monkeypatch.setattr(bootstrap, "_clear_done", lambda name: cleared.append(name))
+
+    bootstrap.step_deps(Config(), _cpu_detection(bootstrap))
+
+    assert cleared == []
