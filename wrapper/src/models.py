@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from . import ndjson, progress
+from . import hfcache, ndjson, progress
 from .config import Config, load_config
 
 
@@ -105,6 +105,9 @@ def resolve_model(config: Config, language: Optional[str] = None) -> ResolvedMod
 
     from huggingface_hub import hf_hub_download  # lazy
 
+    # The hub cannot create symlinks on a normal Windows account and says so at
+    # length before falling back to copying, which works. See hfcache.
+    hfcache.silence_symlink_warning()
     cache_dir = str(config.models_path)
     ckpt = hf_hub_download(repo_id=repo, filename=entry["ckpt_file"], cache_dir=cache_dir)
     vocab = ""

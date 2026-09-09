@@ -35,7 +35,7 @@ from typing import Iterator
 
 import numpy as np
 
-from . import ndjson, progress, selftest
+from . import hfcache, ndjson, progress, selftest
 from .config import Config, load_config
 
 # The wrapper's HTTP contract: s16 mono at this rate. MOSS emits 48 kHz stereo,
@@ -52,27 +52,6 @@ MOSS_LANGUAGES = frozenset(
         "fa", "ar", "pl", "pt", "cs", "da", "sv", "el", "tr",
     }
 )
-
-
-def _use_models_cache(config: Config) -> None:
-    """Point the HuggingFace cache at the wrapper's own ``models/`` directory.
-
-    SET, not ``setdefault``: a machine-wide ``HF_HUB_CACHE`` would otherwise send
-    the worker off to fetch the same weights a second time, and in a container
-    that means they land outside the ``/data/models`` volume on every start.
-    """
-    import os
-
-    cache = str(config.models_path)
-    os.environ["HF_HOME"] = cache
-    os.environ["HF_HUB_CACHE"] = cache
-    # MOSS ships its model code with the weights (`trust_remote_code`), and
-    # transformers writes that code into a SEPARATE cache. Without this it lands
-    # in the user's global one — outside the models volume in a container, and
-    # invisible when debugging why a model loads the wrong code.
-    os.environ["HF_MODULES_CACHE"] = str(Path(cache) / "modules")
-    if config.hf_endpoint:
-        os.environ["HF_ENDPOINT"] = config.hf_endpoint
 
 
 def _model_dirs(config: Config) -> tuple[Path, Path]:
@@ -134,7 +113,7 @@ class MossWorker:
         # import time, so setting them afterwards is too late and the model code
         # lands in whatever machine-wide cache the user happens to have (found
         # live: a global HF_HOME sent it to G:\cache instead of models/).
-        _use_models_cache(config)
+        hfcache.use_models_dir(config)
 
         from moss_tts_nano_runtime import NanoTTSService  # lazy: heavy import
 
@@ -283,7 +262,7 @@ def download_model(config: Config) -> None:
     hook in :mod:`src.progress`.
     """
     config.models_path.mkdir(parents=True, exist_ok=True)
-    _use_models_cache(config)
+    hfcache.use_models_dir(config)
     checkpoint_dir, tokenizer_dir = _model_dirs(config)
     mp = progress.ModelProgress()
     mp.stage("MOSS-TTS-Nano: ")

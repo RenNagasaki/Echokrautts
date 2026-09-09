@@ -116,6 +116,16 @@ longer exists.)
     weggelassen** — es hängt an `pynini` (keine Windows-Wheels), ist lazy importiert, optional, und
     normalisiert ohnehin nur zh/en. `_verify_moss` importiert `moss_tts_nano_runtime` (TOP-LEVEL-Modul,
     nicht das Paket!) vor `deps.done`.
+- `src/hfcache.py` — **die EINE Stelle für den Umgang mit dem HuggingFace-Cache** (2026-09-10).
+  Vorher entschied das jede Engine für sich, woraus zwangsläufig zwei leicht verschiedene Politiken
+  werden. `use_models_dir(config)` **SETZT** `HF_HOME`/`HF_HUB_CACHE`/`HF_MODULES_CACHE` (kein
+  setdefault — ein maschinenweiter Cache schickt den Worker sonst ein zweites Mal auf Download, im
+  Container außerhalb des Volumes; zweimal live passiert) und muss VOR dem Import von transformers
+  laufen. `silence_symlink_warning()` stellt `HF_HUB_DISABLE_SYMLINKS_WARNING` — der Hub kann auf
+  einem normalen Windows-Konto keine Symlinks anlegen, erklärt das in zwei Absätzen und kopiert dann
+  einfach, was funktioniert. Die Warnung ist also Rauschen vor einem Nicht-Problem, und Rauschen im
+  Installationslog kostet Supportzeit (siehe die pydub/ffmpeg-Warnung, wegen der ein Nutzer schrieb).
+  Benutzt von `models.py` (F5) und `moss_backend.py`.
 - `src/audio_compat.py` — `ensure_native_audio_loading()`: replaces `torchaudio.load` with a
   soundfile-based implementation **iff** torchaudio ≥ 2.9 AND torchcodec is absent (`_needs_shim` is
   pure → unit-testable without torch). Exists for exactly one backend: AMD's native-Windows ROCm
