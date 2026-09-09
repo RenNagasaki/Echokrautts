@@ -428,12 +428,15 @@ Nutzer nicht auswählbar, egal wie fertig sie im Wrapper ist.
   markiert mit „erst ab Version X", und kann sie erst nach einem Wrapper-Update wählen. Das ist der
   Zweck von `minVersion`.
 - Eine entfernte Engine fliegt aus der Datei. Wer sie noch eingestellt hat, behält seine Einstellung
-  (das Plugin zeigt weiter, was tatsächlich konfiguriert ist) — und hier ist zu wissen, was der
-  Wrapper damit HEUTE tut: **`engine._default_factory` fällt bei jedem unbekannten `tts_backend`
-  stillschweigend auf F5 zurück**, es gibt keine Prüfung und keine Fehlermeldung. Real erlebt beim
-  Ausbau von Chatterbox: wer es noch konfiguriert hatte, bekam wortlos F5 und eine andere Stimme.
-  **Das ist eine bekannte Lücke, keine Absicht** — wer sie schließt, macht aus dem stillen Rückfall
-  einen sprechenden Fehler beim Start (und aktualisiert diesen Absatz).
+  (das Plugin zeigt weiter, was tatsächlich konfiguriert ist) — der Wrapper **lehnt eine unbekannte
+  Engine seit 2026-09-09 beim Start ab**, mit der Liste der gültigen Namen (`engine.KNOWN_BACKENDS`).
+  Vorher war F5 zugleich Default UND letzter Zweig, also wurde jeder unbekannte Wert stillschweigend
+  zu F5: falsche Stimme, kein Fehler, und `/health` meldete weiter den angefragten Namen. Realistische
+  Quelle ist ein Tippfehler im dokumentierten `F5W_TTS_BACKEND` (steht in allen drei Compose-Dateien)
+  oder eine `id`, die ein Plugin vor einer Umbenennung gespeichert hat.
+- **`KNOWN_BACKENDS` in `engine.py` und die `id`s hier müssen dieselbe Menge sein.** Eine Engine, die
+  nur hier steht, lässt sich wählen und bricht dann beim Start ab; eine, die nur dort steht, ist für
+  Plugin-Nutzer unsichtbar.
 
 ## Multi-backend (install all engines, select one at start)
 - **Install-all / select-at-start:** the bootstrap installs ALL THREE engines and ALL their weights

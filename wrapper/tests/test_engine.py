@@ -6,7 +6,15 @@ import pytest
 
 from conftest import FakeWorker, make_engine
 from src.config import Config
-from src.engine import Engine, InferenceError, QueueFull, TtsParams, _default_factory, float_to_pcm16
+from src.engine import (
+    KNOWN_BACKENDS,
+    Engine,
+    InferenceError,
+    QueueFull,
+    TtsParams,
+    _default_factory,
+    float_to_pcm16,
+)
 from src.gpu_detect import Detection
 from src.jobs import CANCELLED, DONE, ERROR, JobRegistry
 
@@ -313,3 +321,48 @@ def test_health_reports_the_device_the_workers_really_use(config):
 
     assert engine.health()["device"] == "cpu", "must report where the model runs"
     assert engine.health()["backend"] == "cuda", "the machine still has that GPU"
+
+
+@pytest.mark.parametrize("backend", ["chatterbox", "xttts", "", "Moss", "xtts-v2"])
+def test_unknown_backend_fails_loudly(backend):
+    """F5 is the default AND the last branch, so anything unrecognised used to
+    become F5 in silence — wrong voice, no error, and `/health` still reporting
+    the name that was asked for. The realistic source is a typo in the
+    documented `F5W_TTS_BACKEND`, or an id a plugin stored before a rename.
+    """
+    with pytest.raises(ValueError) as err:
+        _default_factory(Config(tts_backend=backend))
+    message = str(err.value)
+    assert backend or "''" in message, "the offending value must appear"
+    for known in KNOWN_BACKENDS:
+        assert known in message, "the message must list what IS valid"
+
+
+@pytest.mark.parametrize("backend", ["f5", "xtts", "moss"])
+def test_every_known_backend_still_resolves(backend):
+    """The guard must not lock out a backend that genuinely exists — and this
+    list is what engines.json publishes to the plugin."""
+    assert _default_factory(Config(tts_backend=backend)) is not None
+
+
+def test_engines_json_matches_the_backends_this_build_knows():
+    """`engines.json` (repo root) is what the Echokraut plugin puts in its
+    dropdown, and `KNOWN_BACKENDS` is what this wrapper will actually start.
+
+    Drift either way is a user-visible bug with no other alarm: an id only in
+    the file is selectable and then refused at startup, and an id only in the
+    code is invisible to everyone using the plugin. The file is published, not
+    imported, so nothing else would ever catch this.
+    """
+    import json
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    engines_file = repo_root / "engines.json"
+    if not engines_file.is_file():
+        pytest.skip("engines.json is only present in a full checkout")
+
+    listed = {e["id"] for e in json.loads(engines_file.read_text(encoding="utf-8"))["engines"]}
+    assert listed == set(KNOWN_BACKENDS), (
+        f"engines.json lists {sorted(listed)}, the engine knows {sorted(KNOWN_BACKENDS)}"
+    )

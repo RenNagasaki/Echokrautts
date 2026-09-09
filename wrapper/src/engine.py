@@ -132,10 +132,30 @@ class F5TTSWorker:
 WorkerFactory = Callable[[int, str], WorkerProtocol]
 
 
+# Every backend this build can load. Kept next to the factory below so the two
+# cannot drift: the list IS what the factory dispatches on.
+KNOWN_BACKENDS = ("f5", "xtts", "moss")
+
+
 def _default_factory(config: Config) -> WorkerFactory:
     # Pick the backend worker for this process (one backend per process, like
     # language). XTTS is imported lazily so its heavy deps (coqui-tts) are only
     # required when actually selected.
+    #
+    # The check exists because F5 is BOTH the default and the last branch, so
+    # without it every unrecognised value quietly became F5: a typo in
+    # `F5W_TTS_BACKEND` (documented, and read from the user's environment file
+    # by all three compose files), or a backend id a plugin stored before it was
+    # renamed. That failure is silent — nothing crashes, the wrong voice just
+    # comes out, and `/health` keeps reporting the value that was asked for.
+    # Failing at startup with the list of valid names costs one line and a
+    # minute of someone's evening instead of an hour.
+    if config.tts_backend not in KNOWN_BACKENDS:
+        raise ValueError(
+            f"unknown tts_backend {config.tts_backend!r} — "
+            f"known backends: {', '.join(KNOWN_BACKENDS)}"
+        )
+
     if config.tts_backend == "xtts":
         def make_xtts(worker_id: int, device: str) -> WorkerProtocol:
             from .xtts_backend import XTTSWorker  # lazy: coqui-tts/torch

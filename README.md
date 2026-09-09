@@ -380,7 +380,8 @@ built-in ASR and cached. The `xtts` backend needs no transcript (it clones from 
 ## TTS backends
 
 The wrapper ships three interchangeable engines. A process loads **one** at startup, selected by
-`tts_backend` (config) or `--tts-backend <f5|xtts|moss>` (default `f5`). `GET /health` reports
+`tts_backend` (config) or `--tts-backend <f5|xtts|moss>` (default `f5`). An unrecognised value is
+rejected at startup with the list of valid names, rather than quietly running F5. `GET /health` reports
 the active backend. All engines are installed by the bootstrap, so switching is only a restart.
 
 | Backend | Model | Reference transcript | Notes |
