@@ -393,6 +393,48 @@ longer exists.)
   geleakter Attention-Hooks je Anfrage, `pykakasi` als einziges GPL-Paket im Baum, und die
   Sonderfälle in `_request_languages`/`BACKEND_NAMES` (Chinesisch `zh` vs. XTTS `zh-cn`).
 
+## `engines.json` (Repo-Root) — die Engine-Liste, die das Plugin liest
+
+**Wer hier eine Engine hinzufügt oder entfernt, pflegt `engines.json` im selben Arbeitsschritt.**
+Das Echokraut-Plugin baut sein Engine-Dropdown aus dieser Datei, nicht mehr aus einer eigenen
+Aufzählung — genau deshalb muss eine neue Engine hier eingetragen werden, sonst ist sie für die
+Nutzer nicht auswählbar, egal wie fertig sie im Wrapper ist.
+
+```jsonc
+{
+  "version": 1,                       // Schema-Version; ändert sich nur, wenn Felder dazukommen
+  "engines": [
+    { "id": "xtts", "name": "XTTS", "minVersion": "0.0.0.1" },
+    { "id": "f5",   "name": "F5",   "minVersion": "0.0.0.1" },
+    { "id": "moss", "name": "MOSS", "minVersion": "0.0.1.0" }
+  ]
+}
+```
+
+- **Im Wrapper liest sie NIEMAND.** Sie ist ein reines Veröffentlichungs-Artefakt für das Plugin und
+  liegt deshalb im Repo-Root, nicht unter `wrapper/`. Sie ist auch **nicht Teil des Release-Archivs**
+  (`build-release-zip.py` packt nur `wrapper/`) — das Plugin holt sie über `raw.githubusercontent`.
+- **`id`** ist exakt der Wert von `--tts-backend`. Das Plugin speichert ihn wörtlich in seiner
+  Konfiguration und reicht ihn durch — ein Tippfehler startet den Wrapper mit einer Engine, die es
+  nicht gibt.
+- **`minVersion`** ist der **Release-Tag, mit dem die Engine zum ersten Mal ausgeliefert wird**, nicht
+  der aktuelle Stand des Branches. Eine noch nicht veröffentlichte Engine trägt also den Tag, den das
+  nächste Release bekommen wird.
+- **Das Plugin liest die Datei am Release-Tag** (`raw.githubusercontent.com/…/<tag>/engines.json`),
+  Rückfall auf `main` und dann auf eine im Plugin eingebettete Kopie. Ein Tag ist eingefroren: was
+  beim Release hier steht, sehen die Nutzer dieser Wrapper-Version für immer — die Datei gehört
+  deshalb **vor** dem Taggen richtiggestellt.
+- Wer eine ältere Wrapper-Version installiert hat, sieht eine neuere Engine trotzdem in der Liste,
+  markiert mit „erst ab Version X", und kann sie erst nach einem Wrapper-Update wählen. Das ist der
+  Zweck von `minVersion`.
+- Eine entfernte Engine fliegt aus der Datei. Wer sie noch eingestellt hat, behält seine Einstellung
+  (das Plugin zeigt weiter, was tatsächlich konfiguriert ist) — und hier ist zu wissen, was der
+  Wrapper damit HEUTE tut: **`engine._default_factory` fällt bei jedem unbekannten `tts_backend`
+  stillschweigend auf F5 zurück**, es gibt keine Prüfung und keine Fehlermeldung. Real erlebt beim
+  Ausbau von Chatterbox: wer es noch konfiguriert hatte, bekam wortlos F5 und eine andere Stimme.
+  **Das ist eine bekannte Lücke, keine Absicht** — wer sie schließt, macht aus dem stillen Rückfall
+  einen sprechenden Fehler beim Start (und aktualisiert diesen Absatz).
+
 ## Multi-backend (install all engines, select one at start)
 - **Install-all / select-at-start:** the bootstrap installs ALL THREE engines and ALL their weights
   into the single `.venv`/`models`. `--tts-backend <f5|xtts|moss>` (config `tts_backend`, default `f5`) only
