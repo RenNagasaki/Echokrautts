@@ -311,7 +311,7 @@ def step_detect(config) -> gpu_detect.Detection:
     return det
 
 
-def _create_venv(python_version: str, index: int, step: str, attempts: int = 5) -> None:
+def _create_venv(python_version: str, index: int, step: str, attempts: int = 8) -> None:
     r"""Create (or replace) the venv, tolerating a directory Windows still holds.
 
     ``--clear`` replaces any pre-existing venv — e.g. one an earlier ``uv run``
@@ -327,6 +327,13 @@ def _create_venv(python_version: str, index: int, step: str, attempts: int = 5) 
     is about to be released, and when it is not, the final message says what to
     do instead of quoting an errno.
     """
+    # MEASURED, not guessed: a first attempt failed 50 ms in and five tries over
+    # ~16 s did not outlast the holder, while the very same command succeeded in
+    # 0.145 s once more time had passed. Whatever holds it — a server unloading
+    # CUDA, an antivirus scanner walking the freshly written files — takes longer
+    # than a handful of seconds. Eight attempts stretch to roughly a minute,
+    # which costs nothing when the handle is already free (the first try
+    # succeeds) and saves a broken installation when it is not.
     delay = 2.0
     for attempt in range(1, attempts + 1):
         try:
@@ -343,9 +350,14 @@ def _create_venv(python_version: str, index: int, step: str, attempts: int = 5) 
                         "versuche es erneut. Ursprungsfehler: " + str(exc)
                     ) from exc
                 raise
+            # Says what is happening NOW (waiting), not what is about to
+            # happen — the previous wording announced the next attempt before
+            # sleeping, which read like it had already started and made the
+            # gaps in the log look like hangs.
             ndjson.progress(
                 index, TOTAL_STEPS, step,
-                f"venv-Verzeichnis noch gesperrt, neuer Versuch {attempt + 1}/{attempts} …",
+                f"venv-Verzeichnis gesperrt, warte {delay:.0f}s "
+                f"(Versuch {attempt}/{attempts} fehlgeschlagen) …",
             )
             time.sleep(delay)
             delay *= 1.5

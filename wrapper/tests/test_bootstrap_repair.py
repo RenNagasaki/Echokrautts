@@ -396,3 +396,30 @@ def test_an_unrelated_venv_failure_is_not_retried(bootstrap, monkeypatch):
     with pytest.raises(bootstrap.FatalError):
         bootstrap._create_venv("3.11", 4, "deps")
     assert len(calls) == 1
+
+
+def test_the_retry_budget_outlasts_a_shutting_down_server(bootstrap, monkeypatch):
+    """Measured, not guessed: five tries over ~16 s did NOT outlast the holder in
+    a real failure, while the same command succeeded once more time had passed.
+    The budget has to be in the tens of seconds, not a handful."""
+    waits = []
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda s: waits.append(s))
+    monkeypatch.setattr(bootstrap.ndjson, "progress", lambda *a, **k: None)
+    monkeypatch.setattr(
+        bootstrap, "_run_uv",
+        lambda *a, **k: (_ for _ in ()).throw(
+            bootstrap.FatalError("failed to remove directory: Zugriff verweigert (os error 5)")
+        ),
+    )
+
+    with pytest.raises(bootstrap.FatalError):
+        bootstrap._create_venv("3.11", 4, "deps")
+
+    assert sum(waits) >= 45, f"only waited {sum(waits):.0f}s in total"
+
+
+def test_a_free_directory_costs_no_waiting(bootstrap, monkeypatch):
+    """The budget must not slow down the normal case."""
+    monkeypatch.setattr(bootstrap, "_run_uv", lambda *a, **k: None)
+    monkeypatch.setattr(bootstrap.time, "sleep", lambda _s: pytest.fail("must not wait"))
+    bootstrap._create_venv("3.11", 4, "deps")
