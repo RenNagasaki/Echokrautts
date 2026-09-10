@@ -544,6 +544,13 @@ def _install_moss(config, py: str, index: int, step: str) -> None:
     deps = [str(d) for d in (spec.get("deps") or [])]
     if deps:
         _run_uv(["pip", "install", "--python", py, *deps], index, step)
+    # onnxruntime is MOSS's faster runtime (same weights, ~2.5x on the CPU) and
+    # is installed here rather than as a MOSS dep, because MOSS is installed
+    # --no-deps and its own requirements never reach the venv.
+    onnx_deps = [str(d) for d in ((config.moss_onnx_install or {}).get("deps") or [])]
+    if onnx_deps:
+        ndjson.progress(index, TOTAL_STEPS, step, "Installiere ONNX-Runtime …", percent=70)
+        _run_uv(["pip", "install", "--python", py, *onnx_deps], index, step)
 
 
 def _verify_moss(py: str, config) -> None:
@@ -719,6 +726,15 @@ def step_model(config) -> None:
     rc = _popen_forward([str(_venv_python()), "-m", "src.moss_backend"], env)
     if rc != 0:
         raise FatalError("MOSS-Modell-Download fehlgeschlagen (siehe stderr/Log)")
+    # The exported graphs for MOSS's faster runtime. NOT fatal: `_default_factory`
+    # falls back to the PyTorch runtime (same model, slower) and says so, and a
+    # 763 MB download failing must not cost a user an otherwise working install.
+    ndjson.progress(index, TOTAL_STEPS, step, "Lade MOSS-ONNX-Modell …", percent=80)
+    if _popen_forward([str(_venv_python()), "-m", "src.moss_onnx_backend"], env) != 0:
+        ndjson.log(
+            "MOSS-ONNX-Download fehlgeschlagen — MOSS läuft auf PyTorch weiter (langsamer)",
+            level="warning",
+        )
     # Voices, not weights — and deliberately NOT fatal: a failed voice pack means
     # "no voices yet", which the user can fix by dropping in a wav. It must never
     # keep an otherwise working install from starting, so a non-zero exit only

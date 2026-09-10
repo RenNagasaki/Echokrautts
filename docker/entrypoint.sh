@@ -32,7 +32,13 @@ download_models() {
         xtts) log "ensuring XTTS-v2 weights in ${F5W_MODELS_DIR:-models} …"
               python -m src.xtts_backend ;;
         moss) log "ensuring MOSS-TTS-Nano weights in ${F5W_MODELS_DIR:-models} …"
-              python -m src.moss_backend ;;
+              python -m src.moss_backend
+              # The exported graphs for MOSS's faster runtime. Not fatal: the
+              # engine falls back to the PyTorch runtime (same model, slower)
+              # and logs why, so a failed 763 MB download costs speed, not the
+              # container.
+              log "ensuring MOSS ONNX graphs in ${F5W_MODELS_DIR:-models} …"
+              python -m src.moss_onnx_backend || log "MOSS ONNX download failed — falling back to the PyTorch runtime" ;;
         *)    log "ensuring F5-TTS weights in ${F5W_MODELS_DIR:-models} …"
               python -m src.models ;;
     esac

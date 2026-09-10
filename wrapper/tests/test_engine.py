@@ -61,6 +61,63 @@ def test_default_factory_selects_xtts(monkeypatch):
     assert made["device"] == "cpu"
 
 
+def test_moss_uses_the_onnx_runtime_when_it_is_available(monkeypatch):
+    """ONNX is the default: same weights, ~2.5x faster on the CPU."""
+    from src import moss_onnx_backend
+
+    class FakeOnnx:
+        def __init__(self, config, device):
+            self.device = device
+
+    monkeypatch.setattr(moss_onnx_backend, "is_available", lambda cfg: (True, ""))
+    monkeypatch.setattr(moss_onnx_backend, "MossOnnxWorker", FakeOnnx)
+    worker = _default_factory(Config(tts_backend="moss", moss_runtime="onnx"))(0, "cpu")
+    assert isinstance(worker, FakeOnnx)
+
+
+def test_moss_falls_back_to_pytorch_and_says_so(monkeypatch):
+    """A missing ONNX install must not cost the user the engine.
+
+    Unlike an unknown BACKEND — which is silently the WRONG voice and therefore
+    fails hard — this substitution is the same model at a different speed, so it
+    degrades. It is logged as a warning because a user who wonders why MOSS got
+    slow deserves to find the answer in the log rather than guess.
+    """
+    from src import moss_backend, moss_onnx_backend, ndjson
+
+    said = []
+    monkeypatch.setattr(ndjson, "log_once", lambda msg, level="info": said.append((level, msg)))
+    monkeypatch.setattr(moss_onnx_backend, "is_available",
+                        lambda cfg: (False, "onnxruntime ist nicht installiert"))
+
+    class FakeMoss:
+        def __init__(self, config, device):
+            self.device = device
+
+    monkeypatch.setattr(moss_backend, "MossWorker", FakeMoss)
+    worker = _default_factory(Config(tts_backend="moss", moss_runtime="onnx"))(0, "cpu")
+    assert isinstance(worker, FakeMoss)
+    assert any(level == "warning" and "onnxruntime" in msg for level, msg in said)
+
+
+def test_moss_runtime_pytorch_never_touches_onnx(monkeypatch):
+    """Choosing the old runtime must not import or probe the new one."""
+    from src import moss_backend, moss_onnx_backend
+
+    def explode(cfg):
+        raise AssertionError("is_available must not be called for moss_runtime=pytorch")
+
+    monkeypatch.setattr(moss_onnx_backend, "is_available", explode)
+
+    class FakeMoss:
+        def __init__(self, config, device):
+            self.device = device
+
+    monkeypatch.setattr(moss_backend, "MossWorker", FakeMoss)
+    worker = _default_factory(Config(tts_backend="moss", moss_runtime="pytorch"))(0, "cpu")
+    assert isinstance(worker, FakeMoss)
+
+
 def test_float_to_pcm16_known_values():
     wav = np.array([0.0, 1.0, -1.0, 2.0, -2.0], dtype=np.float32)
     pcm = float_to_pcm16(wav)

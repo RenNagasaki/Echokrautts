@@ -36,6 +36,7 @@ from typing import Iterator
 import numpy as np
 
 from . import hfcache, ndjson, progress, selftest
+from .moss_audio import ContractResampler
 from .config import Config, load_config
 
 # The wrapper's HTTP contract: s16 mono at this rate. MOSS emits 48 kHz stereo,
@@ -119,6 +120,11 @@ def _resolve_device(config: Config, device: str) -> str:
 class MossWorker:
     """Wraps one MOSS-TTS-Nano service bound to a device."""
 
+    # On, like XTTS. `config.moss_stream` can turn it off per instance for a
+    # consumer that cannot bridge this engine's shortfall (it generates slower
+    # than real time — see the flag's own comment). `infer()` drains
+    # `infer_stream()` either way, so the flag changes who waits, not how the
+    # audio is produced.
     supports_streaming = True
 
     def __init__(self, config: Config, device: str):
@@ -132,8 +138,9 @@ class MossWorker:
 
         self.sample_rate = DEFAULT_SAMPLE_RATE
         self._max_new_frames = int(config.moss_max_new_frames)
-        # Tail of the previous chunk, for seam-free resampling (see _to_contract).
-        self._resample_tail = None
+        self.supports_streaming = bool(config.moss_stream)
+        # Owns the per-chunk conversion AND its cross-chunk state.
+        self._resampler = ContractResampler()
 
         checkpoint, tokenizer = _resolve_model_dirs(config)
         resolved = _resolve_device(config, device)
@@ -162,45 +169,14 @@ class MossWorker:
     # Samples of the previous chunk fed back into the next resample so the filter
     # does not start cold. 64 at 48 kHz is ~1.3 ms — far more than the filter
     # needs, far less than anyone could notice as latency.
-    RESAMPLE_OVERLAP = 64
+    # Kept as a class attribute because the conversion itself now lives in
+    # moss_audio.ContractResampler — two runtimes need it, and a second copy
+    # would have drifted from this one at the first edit.
+    RESAMPLE_OVERLAP = ContractResampler.OVERLAP
 
     def _to_contract(self, waveform, source_rate: int) -> np.ndarray:
-        """MOSS's 48 kHz stereo chunk -> the wrapper's 24 kHz mono float32.
-
-        The conversion happens per chunk because the streaming path has no "end"
-        to do it at — but a resampling filter starting cold on every chunk is
-        audible. **Measured:** resampling each chunk on its own put the largest
-        sample-to-sample jump at the seams at 1.5x the signal's own typical step,
-        with ~60 seams per sentence; that is the crackle a user reported. Feeding
-        the tail of the previous chunk back in drops it to 0.7x, i.e. the seams
-        stop standing out from the audio around them.
-
-        The overlap samples are resampled again and then discarded, which is the
-        cost of not keeping a stateful resampler around: a few dozen samples of
-        arithmetic per chunk.
-        """
-        import torch
-        import torchaudio
-
-        tensor = waveform if hasattr(waveform, "dim") else torch.as_tensor(waveform)
-        tensor = tensor.detach().to("cpu", dtype=torch.float32)
-        if tensor.dim() == 1:
-            tensor = tensor.unsqueeze(0)
-        if tensor.shape[0] > 1:  # stereo (or more) -> mono
-            tensor = tensor.mean(dim=0, keepdim=True)
-        if not source_rate or source_rate == self.sample_rate:
-            return tensor.squeeze(0).numpy().astype(np.float32, copy=False)
-
-        mono = tensor.squeeze(0)
-        lead = self._resample_tail
-        if lead is not None and lead.numel():
-            mono = torch.cat([lead, mono])
-            skip = int(round(lead.numel() * self.sample_rate / source_rate))
-        else:
-            skip = 0
-        self._resample_tail = mono[-self.RESAMPLE_OVERLAP:].clone()
-        out = torchaudio.functional.resample(mono.unsqueeze(0), source_rate, self.sample_rate)
-        return out.squeeze(0)[skip:].numpy().astype(np.float32, copy=False)
+        """MOSS's 48 kHz stereo chunk -> the wrapper's 24 kHz mono float32."""
+        return self._resampler.to_contract(waveform, source_rate, self.sample_rate)
 
     def _cleanup(self, path) -> None:
         """Drop the file the runtime insisted on writing. Never fatal.
@@ -248,7 +224,7 @@ class MossWorker:
         final_path = None
         # Each request starts a new signal: carrying the previous one's tail
         # across would splice the end of the last sentence into this one.
-        self._resample_tail = None
+        self._resampler.reset()
         try:
             for event in self._events(ref_file, gen_text):
                 if event.get("type") == "audio":

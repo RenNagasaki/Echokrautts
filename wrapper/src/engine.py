@@ -166,6 +166,24 @@ def _default_factory(config: Config) -> WorkerFactory:
 
     if config.tts_backend == "moss":
         def make_moss(worker_id: int, device: str) -> WorkerProtocol:
+            # Two runtimes, same weights: ONNX is ~2.5x faster on the CPU and
+            # is the default. It needs a package and a separate download that an
+            # older install does not have, so a machine without them falls back
+            # to PyTorch rather than refusing to start -- MOSS still works, just
+            # slower. Unlike an unknown BACKEND (silently wrong voice, hence the
+            # hard failure above) this substitution is the same model, and it is
+            # said out loud so nobody wonders why it got slow.
+            if str(config.moss_runtime).strip().lower() == "onnx":
+                from . import moss_onnx_backend  # lazy: onnxruntime
+
+                usable, reason = moss_onnx_backend.is_available(config)
+                if usable:
+                    return moss_onnx_backend.MossOnnxWorker(config, device)
+                ndjson.log_once(
+                    f"MOSS: ONNX nicht verfuegbar ({reason}) — nutze PyTorch, "
+                    "das ist etwa 2,5x langsamer",
+                    level="warning",
+                )
             from .moss_backend import MossWorker  # lazy: moss runtime/torch
 
             return MossWorker(config, device)

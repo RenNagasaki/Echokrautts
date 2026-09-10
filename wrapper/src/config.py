@@ -85,6 +85,45 @@ class Config:
     # default). It bounds a generation that never stops on its own; the value is
     # far above any single sentence chunk, so it does not truncate real speech.
     moss_max_new_frames: int = 375
+    # Whether MOSS hands its audio out in pieces as it is produced. ON, like
+    # XTTS — MOSS really streams, and time to first sound is what makes speech
+    # feel immediate in a game.
+    #
+    # Set false to get the clip in ONE piece instead. That exists because MOSS is
+    # the only engine here that generates SLOWER than real time (measured rtf
+    # 1.25-1.44 against F5's 0.32 and XTTS's 0.44): a consumer that starts
+    # playing on the first piece consumes a second of audio per second while
+    # less than a second arrives, so it runs dry part-way through the line, and
+    # the shortfall grows with the length of the line. Bridging that is the
+    # consumer's job — it is the side that knows about playback — and the
+    # Echokraut plugin does it in StreamBufferPolicy. This flag is for a
+    # consumer that cannot, and pays for it with the full generation time
+    # before the first sound.
+    moss_stream: bool = True
+    # Which MOSS runtime the worker pool loads: "onnx" or "pytorch".
+    #
+    # ONNX is the default because it is the SAME weights, exported, and roughly
+    # 2.5x faster on the CPU (measured, ms per 80 ms frame at 4 threads: 41.4
+    # against 115.4). It is the only speed-up measured here that costs no audio
+    # quality -- int8 quantization, fewer codebooks and bfloat16 all change what
+    # the model produces. It also takes MOSS below real time on an ordinary
+    # machine, which removes the reason a consumer had to buffer at all.
+    #
+    # "pytorch" keeps the original runtime. It stays reachable because the ONNX
+    # graphs are a separate ~763 MB download that an older install does not
+    # have, and because a runtime nobody can fall back to is a runtime nobody
+    # can debug against.
+    moss_runtime: str = "onnx"
+    # Intra-op threads for onnxruntime. 0 = pick a modest default (at most 4).
+    # NOT "more is better": 16 threads measured as slow as ONE and slower than
+    # four, and few threads is also the polite choice next to a running game.
+    moss_onnx_threads: int = 0
+    # onnxruntime is installed on its own, not with the MOSS package: MOSS is
+    # installed --no-deps (it pins torch==2.7.0 and would replace the CUDA
+    # build), so its declared extras never reach the venv.
+    moss_onnx_install: dict = field(
+        default_factory=lambda: {"deps": ["onnxruntime>=1.20"]}
+    )
     # How MOSS is installed. It publishes no PyPI package, so this is a pinned
     # source tarball — a COMMIT, not a branch, because a moving `main` would
     # change what users get without anything in this repo changing. The GitHub
@@ -285,6 +324,7 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
         "rate_limit_per_hour",
         "rate_limit_per_ip_per_hour",
         "moss_max_new_frames",
+        "moss_onnx_threads",
     ):
         return int(raw)
     if name in ("vram_reserve_gb", "per_job_gb"):
@@ -293,6 +333,7 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
         "asr_for_missing_ref_text",
         "xtts_fp16",
         "voicepack_auto_download",
+        "moss_stream",
         "trust_forwarded_for",
     ):
         low = raw.lower()
@@ -303,7 +344,7 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
         raise ValueError(f"invalid bool for {name}: {raw!r}")
     if name == "allowed_sample_ext":
         return [s.strip() for s in raw.split(",") if s.strip()]
-    if name in ("languages", "rocm_windows", "moss_install"):
+    if name in ("languages", "rocm_windows", "moss_install", "moss_onnx_install"):
         return json.loads(raw)
     if name in ("api_key", "hf_endpoint", "torch_index_override"):
         return None if raw == "" or raw.lower() == "null" else raw

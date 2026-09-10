@@ -152,8 +152,22 @@ def test_all_four_ffxiv_client_languages_are_supported():
 
 def test_streaming_is_declared_on(fake_moss, tmp_path):
     """The reason this engine was chosen over Qwen: it really streams."""
+    worker = _worker(tmp_path=tmp_path)
+    assert hasattr(worker, "infer_stream")
     assert moss_backend.MossWorker.supports_streaming is True
-    assert hasattr(_worker(tmp_path=tmp_path), "infer_stream")
+    assert worker.supports_streaming is True
+
+
+def test_moss_stream_can_be_turned_off(fake_moss, tmp_path):
+    """The escape hatch for a consumer that cannot bridge a slow producer.
+
+    MOSS generates slower than real time, so anything that starts playing on the
+    first piece has to make up the shortfall itself. Bridging it belongs to the
+    consumer, which is the side that knows about playback; this flag is for one
+    that cannot, and pays the full generation time before the first sound.
+    """
+    cfg = Config(models_dir=str(tmp_path), moss_stream=False)
+    assert _worker(config=cfg).supports_streaming is False
 
 
 def test_no_transcript_is_required(fake_moss, tmp_path):
@@ -350,7 +364,7 @@ def test_the_carried_tail_does_not_leak_between_requests(fake_moss, tmp_path):
     start of the next would be a defect that only shows up in production."""
     worker = _worker(tmp_path=tmp_path)
     list(worker.infer_stream("r.wav", "", "Erster Satz.", 1.0))
-    assert worker._resample_tail is not None, "a tail is kept within a request"
+    assert worker._resampler.tail is not None, "a tail is kept within a request"
 
     lengths = []
     import sys as _sys
@@ -367,4 +381,4 @@ def test_no_overlap_work_when_no_resampling_is_needed(fake_moss, tmp_path):
     worker = _worker(tmp_path=tmp_path)
     worker.sample_rate = 48000
     list(worker.infer_stream("r.wav", "", "Text.", 1.0))
-    assert worker._resample_tail is None
+    assert worker._resampler.tail is None

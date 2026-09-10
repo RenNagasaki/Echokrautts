@@ -107,6 +107,44 @@ longer exists.)
   - **Die Runtime schreibt JEDE Generierung als Datei** und bietet keinen Schalter dagegen. Der
     Worker legt sie deshalb in ein eigenes `models/moss-scratch/` und löscht sie nach jedem Request
     (`_cleanup`, nie fatal) — sonst wächst die Platte bei tausenden Spielzeilen unbegrenzt.
+  - **⚠ DIE SPRACHE DER REFERENZ BESTIMMT DIE LAUTUNG — MOSS hat KEINE Sprachkonditionierung
+    (2026-09-10, vom User gehört bestätigt).** Das Modell leitet die Sprache aus dem TEXT ab; es gibt
+    kein Sprach-Token und kein sprachspezifisches Gewicht. Eine englische Referenzstimme mit deutschem
+    Text ergibt deshalb deutschen Text mit **hartem englischem Akzent**. Das ist kein Fehler der Engine,
+    sondern eine Eigenschaft des Zusammenspiels — und es trifft uns hart, weil **alle 260 Stimmen des
+    ausgelieferten Voice-Packs Englisch sind** (LibriTTS-R, siehe `samples/ATTRIBUTION.csv`).
+    **Gegenprobe gemacht:** derselbe deutsche Satz aus einer echten deutschen Referenz (HUI-Audio-Corpus)
+    klingt „deutlich besser“ (Urteil des Users). F5 (deutsches Finetune) und XTTS (explizites Sprach-Token)
+    haben eine deutsche Lautung im Modell und sind deshalb weniger betroffen — das ist die Erklärung, nicht
+    gemessen. **Folge: ein deutsches Voice-Pack würde MOSS am meisten nützen.** Arbeit im VoicePack-Repo.
+  - **`moss_stream` (Default `true`): MOSS streamt — den Rückstand auszugleichen ist Sache des
+    KONSUMENTEN, nicht des Wrappers (User-Entscheidung 2026-09-10).** Anlass war ein Nutzerbericht:
+    Web-UI (`format:"wav"`, komplett gepuffert) sauber, Stream ins Spiel knistert — bei **denselben
+    Bytes**, denn der Wav-Pfad hängt nur einen RIFF-Header vor genau die Teile des PCM-Pfads. Der
+    Unterschied ist allein die Stückelung.
+    **Ursache, gemessen:** MOSS ist die einzige Engine hier mit **rtf > 1** (1,25–1,44 gegen F5 0,32
+    und XTTS 0,44). Wer beim ersten Teil losspielt, verbraucht eine Sekunde Audio je Sekunde, während
+    weniger als eine ankommt — der Rückstand wächst mit der Satzlänge (**2,80 s** bei einem
+    6,4-s-Satz). Das Plugin startet mit 1 s Kissen (`StreamBufferPolicy.InitialCushionMs`).
+    **Ein fester Vorlauf löst das NICHT** — nötig ist `L ≥ D·(r−1)`, das skaliert mit der Satzlänge.
+    Gemessen an echten Ankunftsprofilen (`scratchpad/moss_headstart.py`): 0,5 s trägt bis ~40 Zeichen,
+    bei 79 Zeichen 1–10 Unterläufe, bei 164 Zeichen 48–52.
+    **Ein fester NACHFÜLL-Wert ist noch schlechter** (`scratchpad/moss_policies.py`, Last durch
+    Strecken der Zeitstempel modelliert). 164 Zeichen / 15 s Audio bei rtf 1,5: fest 0,25 s → **15**
+    Unterbrechungen, 0,5 s → 8, 1,0 s → 4, **Verdoppeln (= Plugin heute) → 2**. Grund: nach dem
+    Nachfüllen von `L` spielt man noch `L·r/(r−1)` Sekunden. **Das vorhandene Verdoppeln ist also
+    bereits die beste dieser Varianten — nicht durch einen Festwert ersetzen.**
+    ⚠ **Der MECHANISMUS des Knisterns ist UNERKLÄRT.** Die naheliegende Vermutung — die 500-ms-Sperre
+    (`MinRebufferIntervalMs`) lasse Unterläufe unbehandelt durch — ist von der Simulation widerlegt
+    (mit und ohne Sperre dieselben 2 sauberen Pausen, null unbehandelte Lücken). Nächster Kandidat:
+    ein Übergang ohne Ausblendung beim Fortsetzen (`FadeInMs` gibt es nur beim ERSTEN Start).
+    Unbelegt, und Plugin-Seite.
+    **`moss_stream=false`** liefert den Satz am Stück (live: `parts=1`, `first`=`generated`; mit
+    `true` `parts=44`) — der Ausweg für einen Konsumenten, der nicht puffern kann, zum Preis der
+    vollen Generierungszeit vor dem ersten Ton. `infer()` zieht `infer_stream()` ohnehin leer, es
+    gibt also nur EINEN Erzeugungspfad; die Flagge entscheidet nur, wer wartet.
+    ⚠ **MOSS ist nicht deterministisch** — zweimal derselbe Satz ergab 6,40 s und 5,28 s Audio. Ein
+    Byte-Vergleich zweier Läufe ist kein gültiges Beweismittel.
   - **48 kHz stereo → 24 kHz mono** je Chunk in `_to_contract` (torchaudio, schon gepinnt).
     Durchreichen wäre nicht laut kaputt, sondern still falsch: Stereo als Mono klingt wie Müll,
     48 kHz als 24 kHz spielt mit halber Geschwindigkeit.
@@ -116,6 +154,42 @@ longer exists.)
     weggelassen** — es hängt an `pynini` (keine Windows-Wheels), ist lazy importiert, optional, und
     normalisiert ohnehin nur zh/en. `_verify_moss` importiert `moss_tts_nano_runtime` (TOP-LEVEL-Modul,
     nicht das Paket!) vor `deps.done`.
+- `src/moss_onnx_backend.py` — **MOSS auf ONNX Runtime, der DEFAULT seit 2026-09-10
+  (`config.moss_runtime`, Werte `onnx` | `pytorch`).** Dieselben Gewichte, nur exportiert — und damit
+  die einzige gemessene Beschleunigung, die KEINE Audioqualität kostet (int8, weniger Codebooks und
+  bfloat16 verändern alle, was das Modell produziert).
+  **Gemessen (Ryzen Zen4, gleicher Satz, fester Seed, ms je 80-ms-Frame — unter 80 = rtf < 1):**
+
+  | Runtime | 1 Thread | 4 Threads | 8 Threads | 16 Threads |
+  |---|---|---|---|---|
+  | PyTorch fp32 | 161,5 | 115,4 | 100,3 | 95,5 |
+  | ONNX | **63,3** | **41,4** | **35,9** | 95,7 ⚠ |
+
+  **ONNX auf EINEM Kern schlägt PyTorch auf sechzehn.** End-to-end durch den echten Server bestätigt:
+  rtf **0,52** gegen 1,15, `parts=19` (Streaming läuft), erster Ton 0,83 s.
+  - ⚠ **`moss_onnx_threads` ist bewusst NIEDRIG (Default höchstens 4), nicht kernzahl-abhängig.**
+    16 Threads waren so langsam wie EINER und langsamer als vier — onnxruntime koordiniert dann mehr
+    als es rechnet. Wenige Threads sind zudem die höfliche Wahl neben einem laufenden Spiel, was der
+    Daseinszweck dieser Engine ist.
+  - **Streaming ist NACHGEBAUT, nicht benutzt:** der Vendor dekodiert inkrementell, gibt aber erst am
+    Ende alles zurück. `_decode_streaming` treibt `generate_audio_frames(on_frame=…)` auf einem Thread
+    und nimmt die Stücke über eine Queue ab — die kleinste Brücke von „ruft zurück“ zu „ist ein
+    Generator“. Die Budget-Politik des Vendors bleibt unangetastet.
+  - **Fehlt onnxruntime oder fehlen die Graphen, fällt `_default_factory` auf PyTorch zurück und SAGT ES**
+    (Warnung). Anders als ein unbekanntes BACKEND — das die falsche Stimme wäre und deshalb hart
+    scheitert — ist das dasselbe Modell in langsamer. `is_available()` unterscheidet die beiden
+    Ursachen, weil sie verschiedene Reparaturen brauchen.
+  - **Kosten: 763 MB** exportierte Graphen (gegen 312 MB Checkpoints), eigene HF-Repos
+    (`MOSS-TTS-Nano-100M-ONNX`, `MOSS-Audio-Tokenizer-Nano-ONNX`), Download ist **nicht fatal**.
+  - `enable_wetext=False` fest verdrahtet: `WeTextProcessing` hängt an `pynini` (keine Windows-Wheels)
+    und normalisiert nur zh/en. ⚠ Der Vendor gibt die Wellenform **kanal-ZULETZT** `(N, 2)` zurück,
+    der PyTorch-Weg `(2, N)`.
+  - **Die GPU ist für MOSS gemessen LANGSAMER als die CPU** (115–123 gegen 95,5 ms/Frame, dtype fast
+    egal) — die Zeit geht in Aufrufe, nicht in Rechnung. Der ONNX-Worker ist deshalb CPU-fest.
+- `src/moss_audio.py` — `ContractResampler`: die 48-kHz-Stereo-zu-24-kHz-Mono-Umwandlung je Chunk, an
+  EINER Stelle für beide MOSS-Laufzeiten. Enthält den Naht-Fix (`OVERLAP = 64`, siehe Knister-Eintrag).
+  **Die Zielrate wird je Aufruf übergeben, nicht gespeichert** — `worker.sample_rate` ist der Vertrag,
+  eine zweite Kopie davon wäre beim ersten Wechsel uneins geworden (ein Test hält genau das fest).
 - `src/hfcache.py` — **die EINE Stelle für den Umgang mit dem HuggingFace-Cache** (2026-09-10).
   Vorher entschied das jede Engine für sich, woraus zwangsläufig zwei leicht verschiedene Politiken
   werden. `use_models_dir(config)` **SETZT** `HF_HOME`/`HF_HUB_CACHE`/`HF_MODULES_CACHE` (kein

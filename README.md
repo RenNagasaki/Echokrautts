@@ -111,7 +111,7 @@ no separate Docker configuration schema. The ones that actually matter in a cont
 
 | Variable | Image default | Meaning |
 | --- | --- | --- |
-| `F5W_TTS_BACKEND` | `xtts` | `xtts` = XTTS-v2, clones from the sample alone, multilingual per request. `f5` = F5-TTS, loads **one** language finetune per process and needs a transcript (or ASR) for the reference clip. `moss` = MOSS-TTS-Nano, multilingual and streaming like XTTS, no transcript needed, and small enough to run on the CPU. |
+| `F5W_TTS_BACKEND` | `xtts` | `xtts` = XTTS-v2, clones from the sample alone, multilingual per request. `f5` = F5-TTS, loads **one** language finetune per process and needs a transcript (or ASR) for the reference clip. `moss` = MOSS-TTS-Nano, multilingual and streaming like XTTS, no transcript needed, and small enough to run on the CPU — but it generates slower than real time, so the consumer has to buffer (see `F5W_MOSS_STREAM`). |
 | `F5W_LANGUAGE` | `de` | F5: which finetune is loaded at startup. XTTS: the fallback when a request omits `language`. |
 | `F5W_XTTS_FP16` | unset (`false`) | XTTS half precision, ~1.4× faster. CUDA only — silently ignored on CPU. |
 | `F5W_API_KEY` | unset | Requires `Authorization: Bearer <key>` on every endpoint. **Set it if the port is reachable from anywhere but the host** — the server binds `0.0.0.0`. |
@@ -404,9 +404,38 @@ it and the graphics card stays with your game, no flag required. Set `moss_devic
 the GPU anyway (a weak CPU with a strong GPU is the case that wants it), or `auto` to follow the
 engine's own detection. All three work as a config entry, a `--moss-device` flag or `F5W_MOSS_DEVICE`.
 
-**Fast to first sound.** It streams for real: 32–64 audio chunks per sentence, with the first one
+**Fast to first sound.** It streams for real: 32–80 audio chunks per sentence, with the first one
 arriving after **0.12 s on GPU / 0.45 s on CPU** — against ~2.4 s for XTTS. Time-to-first-sound is
 what makes speech feel immediate in a game, far more than the total.
+
+**It is also the one engine here that generates SLOWER than real time** (measured rtf 1.25–1.44
+against F5's 0.32 and XTTS's 0.44), and that has a consequence for whoever plays the stream: it
+consumes a second of audio per second while less than a second arrives, so a player that starts on
+the first chunk runs dry part-way through the line, and the shortfall grows with the length of the
+line. Measured against real arrival profiles, a 15-second line at rtf 1.5 needs roughly 7 seconds
+of audio buffered before playback starts to get through in one piece; a fixed head start does not
+work, because the requirement scales with the length of the line. **Bridging that is the consumer's
+job** — it is the side that knows about playback — and the Echokraut plugin does it by growing its
+cushion whenever it runs dry.
+
+Set `moss_stream` to `false` (`--moss-stream false`, `F5W_MOSS_STREAM`) if your consumer cannot:
+the clip is then delivered in one piece and you wait the full generation before the first sound.
+
+**Two runtimes, and the fast one is the default.** `moss_runtime` picks `onnx` (default) or
+`pytorch`. ONNX runs the *same weights*, exported, and is about 2.5x faster on the CPU — measured
+end to end through this server, rtf **0.52** against 1.15, with streaming intact. It is the only
+speed-up here that costs no audio quality. Two things to know: the graphs are a separate ~763 MB
+download, and `moss_onnx_threads` deliberately defaults to at most 4 — past roughly 8 threads
+onnxruntime gives the entire win back (16 threads measured as slow as one). If onnxruntime or the
+graphs are missing, the engine falls back to the PyTorch runtime and logs why, so MOSS keeps working
+and only gets slower.
+
+**The reference clip decides the accent.** MOSS has no language input at all — it works out the
+language from the text — so nothing in the model pulls pronunciation towards the language you asked
+for. Clone an English speaker and ask for a German line and you get German words with an English
+accent. The voice pack shipped with this wrapper is entirely English, so this is the normal case
+rather than an edge one; a reference clip recorded in the target language removes most of it. F5
+(language-specific finetunes) and XTTS (explicit language token) are less affected.
 
 **Small**: 312 MB of weights (a 227 MB model plus its separate 85 MB audio tokenizer) against F5's
 ~5 GB and XTTS's ~2 GB.

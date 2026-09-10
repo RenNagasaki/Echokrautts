@@ -49,6 +49,9 @@
   "moss_audio_tokenizer": "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano",
   "moss_device": "cpu",
   "moss_max_new_frames": 375,
+  "moss_stream": true,
+  "moss_runtime": "onnx",
+  "moss_onnx_threads": 0,
   "moss_install": {
     "package": "https://github.com/OpenMOSS/MOSS-TTS-Nano/archive/8b7bcc9341b3b4ef3a3a58ba1338a7d85ff133eb.tar.gz",
     "deps": ["sentencepiece"]

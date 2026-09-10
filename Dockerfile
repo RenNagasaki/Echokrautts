@@ -39,6 +39,10 @@ ARG DATASETS_CONSTRAINT=datasets>=3.0
 # config.moss_install.
 ARG MOSS_PACKAGE=https://github.com/OpenMOSS/MOSS-TTS-Nano/archive/8b7bcc9341b3b4ef3a3a58ba1338a7d85ff133eb.tar.gz
 ARG MOSS_DEPS="sentencepiece"
+# MOSS's faster runtime: the SAME weights exported to ONNX, about 2.5x quicker
+# on the CPU. Installed separately because the --no-deps above means MOSS's own
+# requirements never reach the venv. Keep in sync with config.moss_onnx_install.
+ARG MOSS_ONNX_DEPS="onnxruntime>=1.20"
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -71,6 +75,7 @@ RUN pip install "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" \
  && pip install /src/wrapper coqui-tts "${TRANSFORMERS_CONSTRAINT}" "${DATASETS_CONSTRAINT}" \
  && pip install --no-deps "${MOSS_PACKAGE}" \
  && pip install ${MOSS_DEPS} \
+ && pip install "${MOSS_ONNX_DEPS}" \
  && pip install "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" \
         --index-url "${TORCH_INDEX_URL}" \
  && pip uninstall -y torchcodec || true
@@ -88,6 +93,8 @@ if u.find_spec("torchcodec") is not None:
 from transformers.pytorch_utils import isin_mps_friendly  # noqa: F401 — XTTS needs it (gone in transformers 5.x)
 import f5_tts.api  # noqa: F401 — catches a rotten datasets/pyarrow resolution (reported live)
 from moss_tts_nano_runtime import NanoTTSService  # noqa: F401 — the --no-deps install must still import
+import onnxruntime  # noqa: F401 — MOSS's fast runtime; without it the engine falls back silently
+import onnx_tts_runtime  # noqa: F401
 print(f"ok: torch {torch.__version__}, no torchcodec, transformers pin holds, f5 + moss load")
 PY
 
