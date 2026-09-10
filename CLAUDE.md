@@ -386,9 +386,15 @@ longer exists.)
   folder** (>100 MB — not held in memory; a partial file must never look like content, and it is
   removed in a `finally`), progress every ~5%. `_safe_members` is a **zip-slip guard**: absolute
   paths, `..` and anything resolving outside the target are skipped, not trusted. **Never raises** —
-  no voices is recoverable by dropping in a wav, a wrapper that refuses to start is not. Called from
-  `bootstrap.step_model` (non-fatal, after the weights) and from `docker/entrypoint.sh`, mirroring
-  how `models.py` serves both paths. Entry point `python -m src.voicepack`. **Live-verified
+  no voices is recoverable by dropping in a wav, a wrapper that refuses to start is not.
+  ⚠ **NUR aus `docker/entrypoint.sh` aufgerufen — der native Bootstrap holt seit 2026-09-10 KEINE
+  Stimmen mehr** (User-Entscheidung: „Docker sollte voicepack selber laden, standalone nicht“). Die
+  Stimmen gehören dem Echokraut-Plugin, das sie selbst installiert, und eine native Installation wird
+  immer von diesem Plugin gefahren — der Wrapper wäre dort ein zweiter Schreiber im selben Ordner.
+  Im Container gibt es kein Plugin und ein leeres Volume macht jedes `/tts` zu einem 404, deshalb
+  bleibt der Weg dort. Ein Test in `test_bootstrap_repair.py` prüft die abgesetzten BEFEHLE, nicht die
+  Existenz des Moduls — das Modul bleibt ja, also würde nur der Aufruf einen Rückfall verraten.
+  Entry point `python -m src.voicepack`. **Live-verified
   2026-08-07:** 523 files (260 wav + 262 txt sidecars + 1 csv, flat, no top-level folder) in ~5 s,
   `SampleService` then lists 260 voices; rerun skips; no `.part` left behind.
 - `src/wav.py` — `wav_header()` / `wrap_pcm()`: the 44-byte canonical RIFF header, hand-written and

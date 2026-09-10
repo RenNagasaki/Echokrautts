@@ -352,11 +352,16 @@ limit is checked first so a rejected caller never occupies queue space. Only `/t
 
 ## Voice samples
 
-**You start with voices.** On first start — an empty `samples` folder, which is also every fresh
-container volume — the wrapper downloads the current **Echokraut voice pack** and unpacks it there
-(~107 MB, 260 voices with reference transcripts). It is skipped as soon as the folder holds any
-audio, and it never blocks startup: no network just means no voices yet, which you fix by dropping in
-a file. Turn it off with `voicepack_auto_download: false` (`F5W_VOICEPACK_AUTO_DOWNLOAD=false`).
+**The voices are not this project's.** They belong to the Echokraut plugin, which installs them
+itself, so a native install fetches nothing — point `samples` at the folder the plugin filled, or
+drop your own files in.
+
+**The container is the exception.** There is no plugin in a container, and a fresh volume starts
+empty, which would make every `/tts` a 404. So on first start with an empty `/data/samples` the
+**container** downloads the current Echokraut voice pack and unpacks it there (~107 MB, 260 voices
+with reference transcripts). It is skipped as soon as the folder holds any audio, and it never
+blocks startup: no network just means no voices yet, which you fix by dropping in a file. Turn it
+off with `voicepack_auto_download: false` (`F5W_VOICEPACK_AUTO_DOWNLOAD=false`).
 
 The pack is found by **release tag prefix** (`voicepack_tag_prefix`, default `EK-VoicePack-`) in
 `voicepack_repo`, not by GitHub's "latest release" — that repository also publishes plugin releases,

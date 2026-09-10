@@ -459,3 +459,33 @@ def test_a_healthy_install_does_not_re_download_models(bootstrap, monkeypatch):
     bootstrap.step_deps(Config(), _cpu_detection(bootstrap))
 
     assert cleared == []
+
+
+# ------------------------------------------------ voices are not our business
+
+def test_the_native_install_does_not_fetch_voices(bootstrap, tmp_path, monkeypatch):
+    """`step_model` downloads WEIGHTS, never the voice pack (decided 2026-09-10).
+
+    The voices belong to the Echokraut plugin, which installs them itself, and a
+    native install is always driven by that plugin — fetching them here would be
+    a second party writing into the same folder. The container is the exception
+    (no plugin, and an empty samples volume makes every /tts a 404), so
+    `src/voicepack.py` stays and `docker/entrypoint.sh` calls it.
+
+    Asserted on the commands actually issued, because the module still exists:
+    nothing about its presence would catch the bootstrap calling it again.
+    """
+    called: list[list[str]] = []
+    monkeypatch.setattr(bootstrap, "_popen_forward", lambda cmd, env: called.append(list(cmd)) or 0)
+    monkeypatch.setattr(bootstrap, "_venv_python", lambda: tmp_path / "python.exe")
+    monkeypatch.setattr(bootstrap, "_mark_done", lambda step: None)
+    monkeypatch.setattr(bootstrap, "_is_done", lambda step: False)
+    monkeypatch.setattr(bootstrap.ndjson, "progress", lambda *a, **k: None)
+    monkeypatch.setattr(bootstrap.ndjson, "log", lambda *a, **k: None)
+    monkeypatch.setattr(bootstrap, "_server_env", lambda config: {})
+
+    bootstrap.step_model(Config(models_dir=str(tmp_path)))
+
+    modules = [c[-1] for c in called if len(c) >= 2 and c[-2] == "-m"]
+    assert "src.voicepack" not in modules, "the native install must not fetch voices"
+    assert "src.models" in modules, "…while the weights it IS responsible for still arrive"

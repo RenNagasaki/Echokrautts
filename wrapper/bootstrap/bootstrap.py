@@ -735,13 +735,12 @@ def step_model(config) -> None:
             "MOSS-ONNX-Download fehlgeschlagen — MOSS läuft auf PyTorch weiter (langsamer)",
             level="warning",
         )
-    # Voices, not weights — and deliberately NOT fatal: a failed voice pack means
-    # "no voices yet", which the user can fix by dropping in a wav. It must never
-    # keep an otherwise working install from starting, so a non-zero exit only
-    # gets logged. The module itself skips the download when samples exist.
-    ndjson.progress(index, TOTAL_STEPS, step, "Prüfe Sprachproben …", percent=90)
-    if _popen_forward([str(_venv_python()), "-m", "src.voicepack"], env) != 0:
-        ndjson.log("Voice-Pack-Download fehlgeschlagen — Installation läuft weiter", level="warning")
+    # NO voice pack here, on purpose (2026-09-10). The voices belong to the
+    # Echokraut plugin, which installs them itself — a native install is always
+    # driven by that plugin, so fetching them here would be a second party
+    # writing into the same folder. `src/voicepack.py` stays for the CONTAINER,
+    # where there is no plugin and an empty samples volume means every /tts is
+    # a 404; `docker/entrypoint.sh` calls it.
     _mark_done(step)
     ndjson.progress(index, TOTAL_STEPS, step, "Sprachmodelle geladen", percent=100, done=True)
 
