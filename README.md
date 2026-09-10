@@ -433,9 +433,11 @@ and only gets slower.
 **The reference clip decides the accent.** MOSS has no language input at all — it works out the
 language from the text — so nothing in the model pulls pronunciation towards the language you asked
 for. Clone an English speaker and ask for a German line and you get German words with an English
-accent. The voice pack shipped with this wrapper is entirely English, so this is the normal case
-rather than an edge one; a reference clip recorded in the target language removes most of it. F5
-(language-specific finetunes) and XTTS (explicit language token) are less affected.
+accent. This repository distributes no voices of its own — the voice pack belongs to the Echokraut
+plugin, and `src/voicepack.py` only fetches it on first start so a fresh install is not mute — but
+that pack is entirely English, so this is the normal case rather than an edge one. A reference clip
+recorded in the target language removes most of it. F5 (language-specific finetunes) and XTTS
+(explicit language token) are less affected.
 
 **Small**: 312 MB of weights (a 227 MB model plus its separate 85 MB audio tokenizer) against F5's
 ~5 GB and XTTS's ~2 GB.

@@ -112,7 +112,11 @@ longer exists.)
     kein Sprach-Token und kein sprachspezifisches Gewicht. Eine englische Referenzstimme mit deutschem
     Text ergibt deshalb deutschen Text mit **hartem englischem Akzent**. Das ist kein Fehler der Engine,
     sondern eine Eigenschaft des Zusammenspiels — und es trifft uns hart, weil **alle 260 Stimmen des
-    ausgelieferten Voice-Packs Englisch sind** (LibriTTS-R, siehe `samples/ATTRIBUTION.csv`).
+    Voice-Packs Englisch sind** (LibriTTS-R, siehe `samples/ATTRIBUTION.csv`).
+    ⚠ **Dieses Repo verteilt KEINE Stimmen.** Das Voice-Pack gehört dem Echokraut-PLUGIN und liegt in
+    dessen Releases (`src/voicepack.py` holt es beim Erststart nur, damit eine frische Installation
+    nicht stumm ist). Ein deutsches Pack ist deshalb Arbeit im Plugin-/VoicePack-Repo, nicht hier —
+    hier gehört nur die Erkenntnis hin, WARUM es gebraucht wird.
     **Gegenprobe gemacht:** derselbe deutsche Satz aus einer echten deutschen Referenz (HUI-Audio-Corpus)
     klingt „deutlich besser“ (Urteil des Users). F5 (deutsches Finetune) und XTTS (explizites Sprach-Token)
     haben eine deutsche Lautung im Modell und sind deshalb weniger betroffen — das ist die Erklärung, nicht
