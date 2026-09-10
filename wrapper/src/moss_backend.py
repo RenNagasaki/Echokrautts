@@ -37,11 +37,9 @@ import numpy as np
 
 from . import hfcache, ndjson, progress, selftest
 from .moss_audio import ContractResampler
+from .moss_common import DEFAULT_SAMPLE_RATE, MossWorkerBase
 from .config import Config, load_config
 
-# The wrapper's HTTP contract: s16 mono at this rate. MOSS emits 48 kHz stereo,
-# so every chunk is downmixed and resampled on the way out (see _to_contract).
-DEFAULT_SAMPLE_RATE = 24000
 
 # ISO codes for the 19 languages the model card lists. MOSS takes NO language
 # argument — it infers the language from the text itself — so this set exists
@@ -117,7 +115,7 @@ def _resolve_device(config: Config, device: str) -> str:
     return "cpu" if device in ("dml", "xpu") else device
 
 
-class MossWorker:
+class MossWorker(MossWorkerBase):
     """Wraps one MOSS-TTS-Nano service bound to a device."""
 
     # On, like XTTS. `config.moss_stream` can turn it off per instance for a
@@ -216,11 +214,7 @@ class MossWorker:
         which is why there is no language argument to pass on. ``speed`` has no
         equivalent either and is reported once rather than silently dropped.
         """
-        if speed != 1.0:
-            ndjson.log_once(
-                "MOSS-TTS-Nano kennt keinen speed-Parameter — der Wert wird ignoriert",
-                level="warning",
-            )
+        self.warn_unsupported_speed(speed)
         final_path = None
         # Each request starts a new signal: carrying the previous one's tail
         # across would splice the end of the last sentence into this one.
@@ -236,38 +230,7 @@ class MossWorker:
         finally:
             self._cleanup(final_path)
 
-    def infer(
-        self,
-        ref_file: str,
-        ref_text: str,
-        gen_text: str,
-        nfe_step: int,
-        speed: float,
-        language: str | None = None,
-    ) -> np.ndarray:
-        """One clip, for the engine's non-streaming path.
 
-        Deliberately drains :meth:`infer_stream` instead of calling the
-        runtime's one-shot method: one code path means the streamed audio and
-        the buffered audio cannot drift apart, and the conversion to the
-        wrapper's format lives in exactly one place.
-        """
-        chunks = list(
-            self.infer_stream(ref_file, ref_text, gen_text, speed, language)
-        )
-        if not chunks:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(chunks).astype(np.float32, copy=False)
-
-    def transcribe(self, audio_path: Path) -> str:
-        # MOSS clones from the reference audio directly; the transcript is never
-        # needed, so ref-text resolution is a no-op for this backend.
-        return ""
-
-    def self_test(self) -> bool:
-        """Tiny inference to confirm the backend works (engine runs this only
-        for fragile dml/xpu devices, which this worker maps to CPU anyway)."""
-        return selftest.run(self)
 
 
 def download_model(config: Config) -> None:

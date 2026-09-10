@@ -207,3 +207,39 @@ def test_the_codec_session_is_reset_around_every_request(monkeypatch, tmp_path):
     worker._runtime.generate_audio_frames = lambda rows, on_frame=None: []
     list(worker._decode_streaming({}, 48000))
     assert session.resets >= 2, "reset before AND after, or state leaks between requests"
+
+
+# --------------------------------------------------- protocol completeness
+
+def test_both_moss_runtimes_satisfy_the_whole_worker_protocol():
+    """Guards the gap that motivated the shared base.
+
+    `MossOnnxWorker` shipped without `self_test`. The engine calls it for
+    fragile devices (dml/xpu/rocm_win) inside a try/except, so the missing
+    attribute did not crash — it was reported as "worker init failed" about a
+    worker that had built perfectly well, and the worker was rebuilt on the CPU
+    for nothing. A silent, misleading degradation is exactly the kind a test has
+    to catch, because nobody goes looking for it.
+    """
+    from src import moss_backend
+
+    required = ("infer", "infer_stream", "transcribe", "self_test", "sample_rate",
+                "supports_streaming")
+    for cls in (moss_backend.MossWorker, moss_onnx_backend.MossOnnxWorker):
+        missing = [name for name in required if not hasattr(cls, name)]
+        assert not missing, f"{cls.__name__} is missing {missing}"
+
+
+def test_the_shared_parts_are_not_duplicated():
+    """Both runtimes inherit these, rather than each carrying a copy.
+
+    Two copies of a protocol method drift apart at the first edit — which is how
+    the missing `self_test` happened in the first place.
+    """
+    from src import moss_backend
+    from src.moss_common import MossWorkerBase
+
+    for cls in (moss_backend.MossWorker, moss_onnx_backend.MossOnnxWorker):
+        assert issubclass(cls, MossWorkerBase)
+        for name in ("infer", "transcribe", "self_test"):
+            assert name not in vars(cls), f"{cls.__name__} re-implements {name}"

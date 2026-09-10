@@ -190,6 +190,15 @@ longer exists.)
     der PyTorch-Weg `(2, N)`.
   - **Die GPU ist für MOSS gemessen LANGSAMER als die CPU** (115–123 gegen 95,5 ms/Frame, dtype fast
     egal) — die Zeit geht in Aufrufe, nicht in Rechnung. Der ONNX-Worker ist deshalb CPU-fest.
+- `src/moss_common.py` — `MossWorkerBase`: was BEIDE MOSS-Laufzeiten teilen (`transcribe`, `infer`,
+  `self_test`, `warn_unsupported_speed`, `DEFAULT_SAMPLE_RATE`). Eine Basisklasse und kein Hilfsmodul,
+  weil es Protokoll-METHODEN sind, die die Engine am Worker-Objekt nachschlaegt.
+  ⚠ **Die Duplikate haben bereits einen Fehler gekostet:** `MossOnnxWorker` ging ohne `self_test`
+  raus. Die Engine ruft es auf dem fragilen Geraetepfad (dml/xpu/rocm_win) in einem `try` auf, also
+  gab es keinen Absturz — nur die Meldung „worker init failed“ ueber einen Worker, der einwandfrei
+  gebaut hatte, und einen unnoetigen Neuaufbau auf der CPU. Eine stille, irrefuehrende Verschlechterung,
+  nach der niemand sucht. Ein Test in `test_moss_onnx_backend.py` haelt jetzt BEIDES fest: dass beide
+  Klassen das ganze Protokoll erfuellen, und dass sie die geteilten Methoden nicht erneut definieren.
 - `src/moss_audio.py` — `ContractResampler`: die 48-kHz-Stereo-zu-24-kHz-Mono-Umwandlung je Chunk, an
   EINER Stelle für beide MOSS-Laufzeiten. Enthält den Naht-Fix (`OVERLAP = 64`, siehe Knister-Eintrag).
   **Die Zielrate wird je Aufruf übergeben, nicht gespeichert** — `worker.sample_rate` ist der Vertrag,

@@ -39,7 +39,7 @@ import numpy as np
 from . import hfcache, ndjson
 from .config import Config
 from .moss_audio import ContractResampler
-from .moss_backend import DEFAULT_SAMPLE_RATE
+from .moss_common import DEFAULT_SAMPLE_RATE, MossWorkerBase
 
 # The two Hugging Face repos holding the exported graphs. Separate from the
 # PyTorch ones, and about 763 MB together against 312 MB for the checkpoints —
@@ -116,7 +116,7 @@ def resolve_threads(config: Config) -> int:
     return max(1, min(4, os.cpu_count() or 1))
 
 
-class MossOnnxWorker:
+class MossOnnxWorker(MossWorkerBase):
     """One ONNX MOSS runtime, behind the same protocol as every other worker."""
 
     supports_streaming = True
@@ -143,10 +143,6 @@ class MossOnnxWorker:
 
     # ---------------------------------------------------------------- protocol
 
-    def transcribe(self, path) -> str:
-        """MOSS clones from the audio alone; there is no transcript to produce."""
-        return ""
-
     def infer_stream(
         self,
         ref_file: str,
@@ -167,31 +163,13 @@ class MossOnnxWorker:
         from the text); ``speed`` has no equivalent and is reported once rather
         than silently dropped, matching the PyTorch worker.
         """
-        if speed != 1.0:
-            ndjson.log_once(
-                "MOSS-TTS-Nano kennt keinen speed-Parameter — der Wert wird ignoriert",
-                level="warning",
-            )
+        self.warn_unsupported_speed(speed)
         self._resampler.reset()
         for chunk, rate in self._raw_chunks(ref_file, gen_text):
             converted = self._resampler.to_contract(chunk, rate, self.sample_rate)
             if converted.size:
                 yield converted
 
-    def infer(
-        self,
-        ref_file: str,
-        ref_text: str,
-        gen_text: str,
-        nfe_step: int,
-        speed: float,
-        language: str | None = None,
-    ) -> np.ndarray:
-        """One clip, by draining :meth:`infer_stream` — one production path only."""
-        chunks = list(self.infer_stream(ref_file, ref_text, gen_text, speed, language))
-        if not chunks:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(chunks).astype(np.float32, copy=False)
 
     # ------------------------------------------------------------------ inside
 
