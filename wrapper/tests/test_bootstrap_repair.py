@@ -185,9 +185,10 @@ def test_verify_venv_runs_the_f5_check_too(bootstrap, monkeypatch):
     monkeypatch.setattr(bootstrap, "_verify_transformers", lambda *a: called.append("transformers"))
     monkeypatch.setattr(bootstrap, "_verify_f5", lambda *a: called.append("f5"))
     monkeypatch.setattr(bootstrap, "_verify_moss", lambda *a: called.append("moss"))
+    monkeypatch.setattr(bootstrap, "_verify_moss_onnx", lambda *a: called.append("moss-onnx"))
 
     bootstrap._verify_venv("py", Config(), "2.7.0")
-    assert called == ["torch", "transformers", "f5", "moss"]
+    assert called == ["torch", "transformers", "f5", "moss", "moss-onnx"]
 
 
 # --------------------------------------------------------------------------
@@ -255,6 +256,7 @@ def test_verify_venv_checks_moss_too(bootstrap, monkeypatch):
     monkeypatch.setattr(bootstrap, "_verify_transformers", lambda *a: None)
     monkeypatch.setattr(bootstrap, "_verify_f5", lambda *a: None)
     monkeypatch.setattr(bootstrap, "_verify_moss", lambda *a: called.append("moss"))
+    monkeypatch.setattr(bootstrap, "_verify_moss_onnx", lambda *a: None)
 
     bootstrap._verify_venv("py", Config(), "2.7.0")
     assert called == ["moss"]
@@ -489,3 +491,52 @@ def test_the_native_install_does_not_fetch_voices(bootstrap, tmp_path, monkeypat
     modules = [c[-1] for c in called if len(c) >= 2 and c[-2] == "-m"]
     assert "src.voicepack" not in modules, "the native install must not fetch voices"
     assert "src.models" in modules, "…while the weights it IS responsible for still arrive"
+
+
+# ------------------------------------------------- upgrading onto a new runtime
+
+def test_a_venv_without_onnxruntime_is_repairable(bootstrap, monkeypatch):
+    """The reported 0.0.1.4 upgrade: MOSS fell back to PyTorch on every start.
+
+    An install predating the ONNX runtime carries a valid `deps.done`, so the
+    dependency step is skipped and onnxruntime never arrives. The engine then
+    degrades to PyTorch, correctly and 2.5x slower, and only the log says why.
+    The venv itself is fine, so this is an in-place repair — the same shape as
+    the 0.0.1.0 upgrade, where an older marker skipped the step that would have
+    installed a newly added engine.
+    """
+    monkeypatch.setattr(bootstrap, "_verify_torch", lambda *a, **k: None)
+    monkeypatch.setattr(bootstrap, "_verify_transformers", lambda *a: None)
+    monkeypatch.setattr(bootstrap, "_verify_f5", lambda *a: None)
+    monkeypatch.setattr(bootstrap, "_verify_moss", lambda *a: None)
+
+    def missing_onnx(*_a, **_k):
+        raise bootstrap.FatalError("moss onnx runtime missing: No module named 'onnxruntime'")
+
+    monkeypatch.setattr(bootstrap, "_verify_moss_onnx", missing_onnx)
+    monkeypatch.setattr(bootstrap, "_venv_python", lambda: Path(__file__))  # exists
+
+    problem, repairable = bootstrap._existing_venv_problem(Config(), "2.7.0")
+    assert problem and repairable is True, "one small package must not force a torch rebuild"
+
+
+def test_onnx_probe_is_skipped_when_switched_off(bootstrap, monkeypatch):
+    """`moss_onnx_install.deps` empty means the user does not want it.
+
+    Then its absence is a choice, not a defect, and must not make every start
+    reinstall something the config just said to leave out.
+    """
+    called = []
+    monkeypatch.setattr(bootstrap.procutil, "run", lambda *a, **k: called.append(a) or _Proc())
+    bootstrap._verify_moss_onnx("py", Config(moss_onnx_install={"deps": []}))
+    assert called == []
+
+
+def test_onnx_probe_checks_the_vendor_module_too(bootstrap, monkeypatch):
+    """The wheel alone proves nothing — the vendor's ONNX module has to import."""
+    seen = []
+    monkeypatch.setattr(bootstrap.procutil, "run", lambda cmd, *a, **k: seen.append(cmd) or _Proc())
+    bootstrap._verify_moss_onnx("py", Config())
+    assert seen, "the probe has to actually run"
+    source = seen[0][-1]
+    assert "onnxruntime" in source and "onnx_tts_runtime" in source

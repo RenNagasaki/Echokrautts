@@ -177,6 +177,7 @@ def _existing_venv_problem(config, torch_version: str) -> tuple[str | None, bool
         # is the ordinary "upgraded to a version that added an engine" case.
         _verify_f5(str(py))
         _verify_moss(str(py), config)
+        _verify_moss_onnx(str(py), config)
     except FatalError as exc:
         return str(exc).split(".")[0], True
     except OSError as exc:
@@ -575,6 +576,35 @@ def _verify_moss(py: str, config) -> None:
         )
 
 
+def _verify_moss_onnx(py: str, config) -> None:
+    """Assert MOSS's ONNX runtime is installed — the FASTER of its two runtimes.
+
+    Missing, the engine still works: it falls back to PyTorch and says so. That
+    is the right behaviour at request time and the wrong thing to rely on at
+    install time, because the fallback is roughly 2.5x slower and silent to
+    anyone not reading the log.
+
+    This is what makes an UPGRADE repair itself. An install from before ONNX
+    existed has a valid `deps.done`, so without a probe that notices the missing
+    package the whole dependency step is skipped and the package never arrives —
+    the same shape of bug as the 0.0.1.0 upgrade, where an older marker skipped
+    the step that would have installed a newly added engine. Reported as
+    REPAIRABLE: the venv is fine, it is one small package short.
+
+    Both imports matter: the wheel alone is not enough, the vendor's ONNX module
+    has to load too.
+    """
+    if not ((config.moss_onnx_install or {}).get("deps")):
+        return  # switched off by config → the engine simply uses PyTorch
+    proc = procutil.run([py, "-c", "import onnxruntime, onnx_tts_runtime"])
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+        raise FatalError(
+            "moss onnx runtime missing: " + " | ".join(tail) + ". "
+            "Wird beim naechsten Start nachinstalliert."
+        )
+
+
 def _verify_venv(py: str, config, torch_version: str) -> None:
     """Run every install assertion against an existing venv.
 
@@ -592,6 +622,7 @@ def _verify_venv(py: str, config, torch_version: str) -> None:
     _verify_transformers(py)
     _verify_f5(py)
     _verify_moss(py, config)
+    _verify_moss_onnx(py, config)
 
 
 def _verify_f5(py: str) -> None:
