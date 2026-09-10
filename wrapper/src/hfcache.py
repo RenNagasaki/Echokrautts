@@ -33,6 +33,31 @@ def silence_symlink_warning() -> None:
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
+def silence_xet_warning() -> None:
+    """Stop the hub nagging about ``hf_xet`` on every single downloaded file.
+
+    Repos on Xet storage make huggingface_hub warn, per file, that installing
+    ``hf_xet`` would download faster. With a few dozen files in a model that is
+    a wall of red text during an install — the same kind of noise as the symlink
+    warning, and the kind that makes users write in asking whether their install
+    is broken.
+
+    **Only when ``hf_xet`` is genuinely absent.** ``HF_HUB_DISABLE_XET`` also
+    switches the feature off, so setting it unconditionally would rob a user who
+    later installs the package of the speed-up they installed it for. When it is
+    missing, the download already falls back to plain HTTP — the flag then
+    changes nothing except whether the fallback is announced forty times.
+
+    The hub reads this constant at IMPORT time, so this has to run before
+    huggingface_hub is imported. :func:`use_models_dir` already has to, for the
+    same reason.
+    """
+    try:
+        import hf_xet  # noqa: F401 — presence is the whole question
+    except ImportError:
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
+
 def use_models_dir(config: Config) -> None:
     """Point every HuggingFace cache at the wrapper's own ``models/`` directory.
 
@@ -48,6 +73,7 @@ def use_models_dir(config: Config) -> None:
     **before importing transformers**, which resolves these paths at import time.
     """
     silence_symlink_warning()
+    silence_xet_warning()
     cache = str(config.models_path)
     os.environ["HF_HOME"] = cache
     os.environ["HF_HUB_CACHE"] = cache

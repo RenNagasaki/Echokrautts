@@ -7,7 +7,10 @@ symlink warning must not be printed at users who cannot do anything about it.
 
 from __future__ import annotations
 
+import builtins
 import os
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -73,3 +76,52 @@ def test_redirecting_also_silences_the_warning(monkeypatch, tmp_path):
     monkeypatch.delenv("HF_HUB_DISABLE_SYMLINKS_WARNING", raising=False)
     hfcache.use_models_dir(Config(models_dir=str(tmp_path)))
     assert os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] == "1"
+
+
+# ---------------------------------------------------------------- Xet warning
+
+def test_xet_warning_is_silenced_when_the_package_is_absent(monkeypatch):
+    """Per-FILE nagging turns a model download into a wall of red text.
+
+    Without `hf_xet` the download already falls back to plain HTTP, so the flag
+    changes nothing except whether that fallback is announced once per file.
+    """
+    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
+    real_import = builtins.__import__
+
+    def without_hf_xet(name, *args, **kwargs):
+        if name == "hf_xet":
+            raise ImportError("no hf_xet")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_hf_xet)
+    hfcache.silence_xet_warning()
+    assert os.environ["HF_HUB_DISABLE_XET"] == "1"
+
+
+def test_xet_stays_enabled_when_the_package_IS_installed(monkeypatch):
+    """The flag also switches the feature OFF.
+
+    Setting it unconditionally would rob a user who installed `hf_xet` of
+    exactly the speed-up they installed it for.
+    """
+    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
+    monkeypatch.setitem(sys.modules, "hf_xet", types.ModuleType("hf_xet"))
+    hfcache.silence_xet_warning()
+    assert "HF_HUB_DISABLE_XET" not in os.environ
+
+
+def test_an_explicit_xet_choice_is_respected(monkeypatch):
+    """setdefault, not set: whoever set it meant it."""
+    monkeypatch.setenv("HF_HUB_DISABLE_XET", "0")
+    monkeypatch.delitem(sys.modules, "hf_xet", raising=False)
+    hfcache.silence_xet_warning()
+    assert os.environ["HF_HUB_DISABLE_XET"] == "0"
+
+
+def test_use_models_dir_also_silences_xet(tmp_path, monkeypatch):
+    """One call has to establish the whole policy, or callers drift apart."""
+    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
+    monkeypatch.delitem(sys.modules, "hf_xet", raising=False)
+    hfcache.use_models_dir(Config(models_dir=str(tmp_path)))
+    assert os.environ.get("HF_HUB_DISABLE_XET") == "1"

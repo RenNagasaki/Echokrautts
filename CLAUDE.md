@@ -212,6 +212,15 @@ longer exists.)
   einem normalen Windows-Konto keine Symlinks anlegen, erklärt das in zwei Absätzen und kopiert dann
   einfach, was funktioniert. Die Warnung ist also Rauschen vor einem Nicht-Problem, und Rauschen im
   Installationslog kostet Supportzeit (siehe die pydub/ffmpeg-Warnung, wegen der ein Nutzer schrieb).
+  **`silence_xet_warning()` (2026-09-10)** stellt `HF_HUB_DISABLE_XET` — aber **nur, wenn `hf_xet`
+  wirklich fehlt**. Repos auf Xet-Speicher lassen den Hub JE DATEI warnen, dass `hf_xet` schneller
+  waere; bei einem Modell mit Dutzenden Dateien ist das eine Wand aus rotem Text (vom User gemeldet:
+  „die Warnungen nerven“). Ohne das Paket faellt der Download ohnehin auf normales HTTP zurueck — der
+  Schalter aendert also nichts ausser der Ansage. **Die Bedingung ist tragend:** derselbe Schalter
+  schaltet die Funktion AUS, unbedingt gesetzt haette er einem Nutzer, der `hf_xet` spaeter
+  installiert, genau den Tempogewinn genommen, fuer den er es installiert hat.
+  **Live belegt** an einem echten 44-MB-Download aus einem Xet-Repo: ohne Schalter 1 Warnung, mit
+  Schalter 0, Datei kommt beide Male an.
   Benutzt von `models.py` (F5) und `moss_backend.py`.
 - `src/audio_compat.py` — `ensure_native_audio_loading()`: replaces `torchaudio.load` with a
   soundfile-based implementation **iff** torchaudio ≥ 2.9 AND torchcodec is absent (`_needs_shim` is
