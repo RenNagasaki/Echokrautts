@@ -34,7 +34,7 @@ from pathlib import Path
 WRAPPER_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(WRAPPER_ROOT))
 
-from src import gpu_detect, ndjson, procutil  # noqa: E402
+from src import gpu_detect, instance, ndjson, procutil  # noqa: E402
 from src.config import load_config  # noqa: E402
 
 TOTAL_STEPS = 6
@@ -132,6 +132,65 @@ def _install_kill_on_close_job() -> None:
     except OSError as exc:
         ndjson.log(f"orphan protection: job setup failed ({exc}), using watchdog", "warning")
         return
+
+
+# ----------------------------------------------------------------- ownership
+# Held for the bootstrap's whole life, serving included (module global so it is
+# never garbage-collected and released early). See src/instance.py for the
+# tester log that made this necessary.
+_INSTANCE_LOCK = instance.InstanceLock(STATE_DIR)
+
+
+def _claim_install_folder() -> None:
+    """Become the only bootstrap in this folder, then clear out what an earlier
+    one left running. A second bootstrap used to go straight to ``uv venv
+    --clear`` on a venv the first was still installing into, and wrecked it."""
+    try:
+        stopped = instance.take_over(_INSTANCE_LOCK, instance.terminate)
+    except TimeoutError as exc:
+        raise FatalError(
+            f"Ein anderer EchokrauTTS-Bootstrap (pid {exc.args[0]}) läuft in diesem Ordner "
+            "und ließ sich nicht beenden. Beende ihn im Task-Manager und versuche es erneut."
+        ) from exc
+    if stopped is not None:
+        ndjson.log(
+            f"Ein anderer Bootstrap (pid {stopped}) lief noch in diesem Ordner — beendet, "
+            "dieser Lauf übernimmt",
+            level="warning",
+        )
+    _stop_stale_processes()
+
+
+def _stop_stale_processes(wait: float = 10.0) -> None:
+    """Stop everything still running from our venv or our uv.
+
+    Safe only because we hold the instance lock: no other bootstrap owns this
+    folder, so whatever runs from it is a leftover — an orphaned server, the
+    ``uv`` of a killed install. On Windows those are exactly what keeps
+    ``.venv\\Scripts`` undeletable. Never raises: a failed sweep leaves the
+    retry loop in ``_create_venv`` to do what it did before.
+    """
+    try:
+        pids = instance.stale_processes(
+            instance.list_processes(), [VENV_DIR, UV_DIR], os.getpid()
+        )
+        if not pids:
+            return
+        ndjson.log(
+            f"Beende {len(pids)} verwaiste(n) Prozess(e) aus der Installation "
+            f"(pid {', '.join(map(str, pids))})",
+            level="warning",
+        )
+        for pid in pids:
+            instance.terminate(pid)
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            alive = {p.pid for p in instance.list_processes()}
+            if not alive.intersection(pids):
+                return
+            time.sleep(0.25)
+    except Exception as exc:  # noqa: BLE001 — best effort, see docstring
+        ndjson.log(f"Aufräumen verwaister Prozesse fehlgeschlagen: {exc}", level="warning")
 
 
 # --------------------------------------------------------------------- state
@@ -361,6 +420,10 @@ def _create_venv(python_version: str, index: int, step: str, attempts: int = 8) 
                 f"(Versuch {attempt}/{attempts} fehlgeschlagen) …",
             )
             time.sleep(delay)
+            # Something may have started from the venv since the claim (a
+            # verification subprocess of this very step, a server a host just
+            # launched) — we own the folder, so it goes.
+            _stop_stale_processes()
             delay *= 1.5
 
 
@@ -865,6 +928,7 @@ def main(argv: list[str] | None = None) -> int:
     _install_kill_on_close_job()
     try:
         config = load_config(argv)
+        _claim_install_folder()
         step_uv()
         step_python(config.python_version)
         det = step_detect(config)

@@ -41,6 +41,13 @@ def bootstrap():
     return _load_bootstrap()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_process_sweep(bootstrap, monkeypatch):
+    """The retry loop sweeps leftover processes from the REAL wrapper venv —
+    a test must never stop a server the developer has running."""
+    monkeypatch.setattr(bootstrap, "_stop_stale_processes", lambda *a, **k: None)
+
+
 class _Proc:
     def __init__(self, returncode=0, stdout="", stderr=""):
         self.returncode = returncode

@@ -11,7 +11,7 @@ longer exists.)
 ## Build / Test
 - Tooling: `uv` (at `~/.local/bin/uv`) + system Python 3.12. No dotnet here.
 - **Unit tests** (mock torch/f5-tts, run anywhere): `wrapper/.venv-test` with `pytest pytest-asyncio
-  httpx fastapi numpy`, then `.venv-test/Scripts/python -m pytest -q` → **96 passed, 1 skipped**
+  httpx fastapi numpy`, then `.venv-test/Scripts/python -m pytest -q` → **373 passed, 1 skipped** (2026-11-01)
   (skip = symlink test, Windows privilege). Suite must stay green.
 - **Runtime venv** (`wrapper/.venv`, gitignored): created by the bootstrap with torch+f5-tts.
 
@@ -246,6 +246,23 @@ longer exists.)
   desc=filename) and coqui (XTTS, `unit="iB"`, no desc → label "Download") route through it because
   they bind their `tqdm` reference on first import and the wrapper imports them lazily. tqdm import
   is lazy so the module (and the tqdm-less test venv) imports fine; absent tqdm → silent no-op.
+- `src/instance.py` — **ein Installationsordner, ein Besitzer (2026-09-27, aus einem Tester-Log).**
+  Der Installer wurde gestartet, während Lauf 1 noch torch installierte. Der zweite Bootstrap machte
+  `uv venv --clear` auf ein venv, in das der erste noch schrieb (`Lib: directory is not empty`,
+  os error 145). Danach hielten die Reste `.venv\Scripts` dauerhaft fest (os error 5, 30 min lang,
+  über drei Spielneustarts). `InstanceLock` (`.state/bootstrap.lock`, msvcrt/fcntl; die PID steht in
+  einer EIGENEN Datei `bootstrap.pid`, weil ein Windows-Byte-Lock die gesperrten Bytes für alle
+  anderen unlesbar macht) wird als ERSTES in `main()` genommen, über `_claim_install_folder` und für
+  die ganze Lebenszeit samt Serve gehalten. Das OS gibt ihn beim Tod frei, verwaiste Locks gibt es
+  also nicht. **Der neue Lauf ÜBERNIMMT** (`take_over`): er beendet den Halter, dessen
+  Kill-on-close-Job dann den ganzen Baum mitnimmt. Danach beendet `_stop_stale_processes` alles, was
+  aus `.venv` oder `.uv` läuft, samt Nachfahren (ein venv-`python.exe` ist nur ein Launcher, der
+  echte Interpreter ist sein KIND). Das läuft auch zwischen den Retries in `_create_venv`.
+  Ausgenommen sind wir selbst und unsere Vorfahren, denn der Host startet uns über
+  `.uv\uv.exe run`. **Bewusst NICHT der ganze Wrapper-Ordner**, dort liegt auch `.venv-test`.
+  ⚠ Folge: zwei Starter im selben Ordner laufen nicht mehr parallel (auch nicht auf verschiedenen
+  Ports). Der zweite beendet den ersten. Nie fatal: Ein fehlgeschlagener Sweep wird nur geloggt.
+  Live geprüft: Übernahme eines echten Lock-Halters in 0,25 s.
 - `src/procutil.py` — subprocess helper with `CREATE_NO_WINDOW` (no console flashes, SPEC §8.5).
 - `src/streaming.py` — `chunk_text()` sentence chunking (pure, model-free).
 - `src/samples.py` — `SampleService`: basename-only resolution + traversal guard. A voice is EITHER a
