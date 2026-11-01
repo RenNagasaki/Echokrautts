@@ -125,3 +125,71 @@ def test_use_models_dir_also_silences_xet(tmp_path, monkeypatch):
     monkeypatch.delitem(sys.modules, "hf_xet", raising=False)
     hfcache.use_models_dir(Config(models_dir=str(tmp_path)))
     assert os.environ.get("HF_HUB_DISABLE_XET") == "1"
+
+
+def _fake_hub_with_racy_probe(monkeypatch):
+    """A stand-in for huggingface_hub.file_download whose probe has the real
+    library's flaw: it caches ``True`` first and corrects it after a slow test."""
+    import threading
+    import time
+
+    cache: dict = {}
+    fd = types.ModuleType("huggingface_hub.file_download")
+
+    def are_symlinks_supported(cache_dir=None):
+        if cache_dir not in cache:
+            cache[cache_dir] = True
+            time.sleep(0.05)  # the test symlink being attempted
+            cache[cache_dir] = False  # it failed: no Developer Mode
+        return cache[cache_dir]
+
+    fd.are_symlinks_supported = are_symlinks_supported
+    hub = types.ModuleType("huggingface_hub")
+    hub.file_download = fd
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    monkeypatch.setitem(sys.modules, "huggingface_hub.file_download", fd)
+    return fd, threading
+
+
+def _ask_from_threads(fd, threading, n=8):
+    answers = []
+    barrier = threading.Barrier(n)
+
+    def ask():
+        barrier.wait()
+        answers.append(fd.are_symlinks_supported("models--tts-hub--XTTS-v2"))
+
+    threads = [threading.Thread(target=ask) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return answers
+
+
+def test_the_unguarded_probe_lies_to_parallel_threads(monkeypatch):
+    """Pins the failure itself: without the guard, threads asking while the
+    probe runs are told symlinks work — and then die with WinError 1314."""
+    fd, threading = _fake_hub_with_racy_probe(monkeypatch)
+    assert True in _ask_from_threads(fd, threading)
+
+
+def test_the_serialized_probe_gives_every_thread_the_real_answer(monkeypatch):
+    """XTTS downloads through an eight-thread snapshot_download. A user's
+    install died on exactly this (2026-11-01)."""
+    fd, threading = _fake_hub_with_racy_probe(monkeypatch)
+    hfcache.serialize_symlink_probe()
+    assert _ask_from_threads(fd, threading) == [False] * 8
+
+
+def test_serializing_twice_wraps_once(monkeypatch):
+    fd, _ = _fake_hub_with_racy_probe(monkeypatch)
+    hfcache.serialize_symlink_probe()
+    first = fd.are_symlinks_supported
+    hfcache.serialize_symlink_probe()
+    assert fd.are_symlinks_supported is first
+
+
+def test_without_the_hub_installed_nothing_happens(monkeypatch):
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)
+    hfcache.serialize_symlink_probe()  # must not raise

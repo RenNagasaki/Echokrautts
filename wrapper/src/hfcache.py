@@ -9,6 +9,7 @@ here and imported rather than repeated.
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 from .config import Config
@@ -31,6 +32,44 @@ def silence_symlink_warning() -> None:
     change it without asking users to enable Developer Mode.
     """
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
+
+_probe_lock = threading.Lock()
+
+
+def serialize_symlink_probe() -> None:
+    """Make huggingface_hub's symlink probe safe under a parallel download.
+
+    ``are_symlinks_supported`` caches its answer per directory, but writes
+    ``True`` into that cache BEFORE it has tested anything and only flips it to
+    ``False`` once the test symlink failed. ``snapshot_download`` fetches with
+    eight threads; every thread that asks during that window reads the
+    provisional ``True``, calls ``os.symlink`` for real and dies with
+    ``WinError 1314`` on a Windows account without Developer Mode. Single-file
+    downloads (``hf_hub_download``, used for F5) never hit it — the XTTS
+    download through Coqui's ModelManager does, as a user's install log showed
+    (2026-11-01): the "cannot create symlinks" warning and the fatal symlink
+    error came out of the same second.
+
+    The fix is to hold a lock around the whole probe, so the second thread waits
+    for the real answer. ``_create_symlink`` looks the function up as a module
+    global, so replacing that attribute is enough. Idempotent.
+    """
+    try:
+        from huggingface_hub import file_download  # lazy: heavy import
+    except ImportError:
+        return  # nothing downloads from the hub then, so nothing can race
+
+    original = file_download.are_symlinks_supported
+    if getattr(original, "_echokraut_serialized", False):
+        return
+
+    def locked(cache_dir=None):
+        with _probe_lock:
+            return original(cache_dir)
+
+    locked._echokraut_serialized = True  # type: ignore[attr-defined]
+    file_download.are_symlinks_supported = locked
 
 
 def silence_xet_warning() -> None:

@@ -212,6 +212,13 @@ longer exists.)
   einem normalen Windows-Konto keine Symlinks anlegen, erklärt das in zwei Absätzen und kopiert dann
   einfach, was funktioniert. Die Warnung ist also Rauschen vor einem Nicht-Problem, und Rauschen im
   Installationslog kostet Supportzeit (siehe die pydub/ffmpeg-Warnung, wegen der ein Nutzer schrieb).
+  ⚠ **Der Fallback hat ein Race (Nutzer-Log 2026-11-01, `WinError 1314` beim XTTS-Download):**
+  `are_symlinks_supported` schreibt VOR dem Test `True` in seinen Cache; `snapshot_download` (8
+  Threads, so lädt Coqui XTTS) liest das in dem Fenster und ruft echtes `os.symlink`.
+  `serialize_symlink_probe()` legt einen Lock um die Probe (ersetzt das Modul-Attribut in
+  `huggingface_hub.file_download`) und MUSS vor jedem parallelen Hub-Download laufen — aufgerufen
+  in `xtts_backend._resolve_model_dir`. F5 (`hf_hub_download`, einzeln) und MOSS (`local_dir`) sind
+  nicht betroffen. Workaround für Nutzer ohne Fix: Windows-Entwicklermodus einschalten.
   **`silence_xet_warning()` (2026-09-10)** stellt `HF_HUB_DISABLE_XET` — aber **nur, wenn `hf_xet`
   wirklich fehlt**. Repos auf Xet-Speicher lassen den Hub JE DATEI warnen, dass `hf_xet` schneller
   waere; bei einem Modell mit Dutzenden Dateien ist das eine Wand aus rotem Text (vom User gemeldet:

@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import ndjson, progress, selftest
+from . import hfcache, ndjson, progress, selftest
 from .config import Config, load_config
 
 # Coqui model id for XTTS-v2 (multilingual, multi-dataset).
@@ -177,6 +177,9 @@ def _resolve_model_dir(config: Config) -> str:
 
     # Accept the CPML non-interactively so the download never blocks on a prompt.
     os.environ.setdefault("COQUI_TOS_AGREED", "1")
+    # Coqui downloads with a parallel snapshot_download — without this, a
+    # Windows account without Developer Mode dies with WinError 1314.
+    hfcache.serialize_symlink_probe()
     from TTS.utils.manage import ModelManager  # lazy: heavy import
 
     manager = ModelManager(output_prefix=str(config.models_path))
