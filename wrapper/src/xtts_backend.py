@@ -184,6 +184,11 @@ def _resolve_model_dir(config: Config) -> str:
 
     manager = ModelManager(output_prefix=str(config.models_path))
     model_path, _config_path, _item = manager.download_model(XTTS_MODEL)
+    # Older coqui-tts returns the model directory; newer releases (HF-hub
+    # download of ``tts-hub/XTTS-v2``) return the ``model.pth`` file inside the
+    # snapshot. Callers need the directory (config.json + checkpoint_dir).
+    if Path(model_path).is_file():
+        return str(Path(model_path).parent)
     return model_path
 
 

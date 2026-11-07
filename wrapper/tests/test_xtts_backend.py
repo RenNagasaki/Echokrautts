@@ -230,3 +230,33 @@ def test_resolve_model_dir_downloads_and_accepts_license(tmp_path, monkeypatch):
     assert captured["output_prefix"] == str(cfg.models_path)
     # The CPML must be accepted non-interactively so the download never blocks.
     assert os.environ["COQUI_TOS_AGREED"] == "1"
+
+
+def test_resolve_model_dir_accepts_checkpoint_file_path(tmp_path, monkeypatch):
+    # Newer coqui-tts (HF-hub download) returns .../snapshots/<rev>/model.pth
+    # instead of the directory; the resolver must hand back the directory, or
+    # the worker dies opening "model.pth/config.json" at startup.
+    cfg = Config(models_dir=str(tmp_path / "models"))
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "model.pth").write_bytes(b"weights")
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+
+    class FakeManager:
+        def __init__(self, output_prefix=None):
+            pass
+
+        def download_model(self, model_id):
+            return (
+                str(snapshot / "model.pth"),
+                str(snapshot / "config.json"),
+                {},
+            )
+
+    fake_manage = types.ModuleType("TTS.utils.manage")
+    fake_manage.ModelManager = FakeManager
+    monkeypatch.setitem(sys.modules, "TTS", types.ModuleType("TTS"))
+    monkeypatch.setitem(sys.modules, "TTS.utils", types.ModuleType("TTS.utils"))
+    monkeypatch.setitem(sys.modules, "TTS.utils.manage", fake_manage)
+
+    assert xtts_backend._resolve_model_dir(cfg) == str(snapshot)
