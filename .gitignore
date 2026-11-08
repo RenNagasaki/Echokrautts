@@ -2,6 +2,8 @@
 # (The install-state ignores for the bare-metal install live in wrapper/.gitignore.)
 /models/
 /samples/
+# tools/windows-test.sh: results fetched back from the Windows PC
+/windows-test-out/
 .env
 
 # Machine-local Claude Code state (worklog, verify script).
