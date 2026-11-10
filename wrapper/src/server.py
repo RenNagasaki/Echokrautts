@@ -27,8 +27,14 @@ from pathlib import Path
 
 from . import ndjson, wav
 from .config import Config, load_config
-from .engine import Engine, QueueFull, TtsParams
+from .engine import Engine, QueueFull, Reference, TtsParams
 from .gpu_detect import detect_backend
+from .inline_ref import (
+    INLINE_SAMPLE_RATE,
+    InvalidInlineReference,
+    build_reference,
+    decode_pcm16,
+)
 from .jobs import JobRegistry
 from .ratelimit import RateLimitExceeded, RateLimiter, client_address
 from .samples import InvalidSample, SampleNotFound
@@ -39,11 +45,28 @@ from .samples import InvalidSample, SampleNotFound
 UI_INDEX = Path(__file__).resolve().parent / "static" / "index.html"
 
 
+# Longest clip /asr-check accepts: one Whisper window. The plugin only checks
+# candidate references (3-15 s), so anything longer is a client bug.
+ASR_MAX_SECONDS = 30.0
+
+
 class TtsRequest(BaseModel):
-    sample: str = Field(..., description="Basename in samples/ (required).")
+    # Exactly one of ``sample`` and ``ref_audio`` (checked in the handler, so
+    # the answer is a plain 400 like every other validation error here).
+    sample: Optional[str] = Field(None, description="Basename in samples/.")
     text: str
     language: Optional[str] = None
+    # With ``sample``: fallback transcript (a sidecar wins). With ``ref_audio``:
+    # REQUIRED, the game text of the clip — no ASR fills it in.
     ref_text: Optional[str] = None
+    # Inline reference (plan game-voice-reference §2.4): base64 PCM s16le,
+    # 24 kHz mono. Kept in RAM for this request only — never written to
+    # samples/, never a temp file.
+    ref_audio: Optional[str] = Field(None, description="base64 PCM s16le 24 kHz mono.")
+    # Ids of the clips ``ref_audio`` was built from (the plugin sends the game
+    # clip ids). Their hash keys the conditioning cache; without them the key
+    # is the hash of audio + text.
+    ref_ids: Optional[list[str]] = None
     # Bounded because both reach the engine unchecked otherwise, and both are
     # now editable in the built-in UI. speed <= 0 is not slow, it is undefined;
     # a huge nfe_step holds a worker for minutes (the pool takes exactly one per
@@ -58,6 +81,13 @@ class TtsRequest(BaseModel):
     # RIFF header needs the total length, and the alternative (a header claiming
     # an unknown size) is honoured inconsistently across browsers.
     format: str = "pcm"
+
+
+class AsrCheckRequest(BaseModel):
+    """``POST /asr-check``: audio in, text out, nothing stored (plan §4)."""
+
+    audio: str = Field(..., description="base64 PCM s16le 24 kHz mono.")
+    language: Optional[str] = None
 
 
 # Display names of the backends for user-facing messages.
@@ -231,6 +261,43 @@ def create_app(
     def _engine(request: Request) -> Engine:
         return request.app.state.engine
 
+    # Whisper inside F5 is one process-wide pipeline and not thread-safe, so
+    # /asr-check runs one at a time. An asyncio lock (not a thread lock) so
+    # waiting callers do not each hold an executor thread that the TTS workers
+    # need; bounded by max_queue like the engine, answering 503 beyond it.
+    asr_lock = asyncio.Lock()
+    asr_waiting = {"n": 0}
+
+    def _resolve_reference(eng: Engine, req: TtsRequest) -> Reference:
+        """The request's reference as a sample path or an in-memory voice.
+
+        Raises the HTTP error itself so /tts reads top to bottom.
+        """
+        if (req.sample is None) == (req.ref_audio is None):
+            raise HTTPException(
+                status_code=400, detail="exactly one of 'sample' or 'ref_audio' is required"
+            )
+        if req.ref_audio is not None:
+            if not eng.supports_inline_reference:
+                name = BACKEND_NAMES.get(config.tts_backend, config.tts_backend)
+                raise HTTPException(
+                    status_code=501,
+                    detail=f"inline reference audio is not supported by {name} "
+                    f"on this runtime (see /health inline_reference)",
+                )
+            try:
+                return build_reference(
+                    req.ref_audio, req.ref_text, req.ref_ids, config.inline_ref_max_seconds
+                )
+            except InvalidInlineReference as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+        try:
+            return eng.samples.resolve_path(req.sample)
+        except InvalidSample as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except SampleNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+
     @app.post("/tts", dependencies=[Depends(api_key_dep)])
     async def tts(req: TtsRequest, request: Request):
         eng: Engine = _engine(request)
@@ -244,12 +311,7 @@ def create_app(
                 status_code=400, detail=f"format must be 'pcm' or 'wav', not {req.format!r}"
             )
         # Validate + admit BEFORE the 200 stream starts, so error codes are real.
-        try:
-            audio_path = eng.samples.resolve_path(req.sample)
-        except InvalidSample as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        except SampleNotFound as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
+        reference = _resolve_reference(eng, req)
         # Rate limit BEFORE admission: a rejected caller must not touch the
         # queue at all. The two are different answers — 429 "you have had your
         # share this hour" vs 503 "busy right now, retry shortly".
@@ -268,7 +330,7 @@ def create_app(
 
         job = jobs.create()
         params = TtsParams(
-            sample=req.sample,
+            sample=req.sample or "",
             text=req.text,
             language=language,
             ref_text=req.ref_text,
@@ -285,7 +347,7 @@ def create_app(
             # Buffered on purpose — see TtsRequest.format. Everything else about
             # the request (validation, admission, job, cancel) is identical.
             pcm = bytearray()
-            async for part in eng.stream(job, params, audio_path):
+            async for part in eng.stream(job, params, reference):
                 pcm += part
             return Response(
                 content=wav.wrap_pcm(bytes(pcm), sample_rate=eng.sample_rate),
@@ -293,10 +355,47 @@ def create_app(
                 headers=headers,
             )
         return StreamingResponse(
-            eng.stream(job, params, audio_path),
+            eng.stream(job, params, reference),
             media_type="audio/pcm",
             headers=headers,
         )
+
+    @app.post("/asr-check", dependencies=[Depends(api_key_dep)])
+    async def asr_check(req: AsrCheckRequest, request: Request):
+        """Transcribe in-memory audio; nothing is stored (plan §4, Teil C).
+
+        The plugin compares the result with the game text to rank candidate
+        reference clips. Same wire format as an inline ``ref_audio``.
+        """
+        eng: Engine = _engine(request)
+        try:
+            audio = decode_pcm16(req.audio)
+        except InvalidInlineReference as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        seconds = audio.shape[-1] / float(INLINE_SAMPLE_RATE)
+        if seconds > ASR_MAX_SECONDS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"audio is {seconds:.2f}s, at most {ASR_MAX_SECONDS:g}s allowed",
+            )
+        if asr_waiting["n"] >= max(1, config.max_queue):
+            raise HTTPException(status_code=503, detail="asr queue is full")
+        asr_waiting["n"] += 1
+        try:
+            async with asr_lock:
+                loop = asyncio.get_running_loop()
+                try:
+                    text = await loop.run_in_executor(
+                        None, eng.transcribe_pcm, audio, INLINE_SAMPLE_RATE, req.language
+                    )
+                except Exception as exc:  # noqa: BLE001 — surface as 500, keep serving
+                    ndjson.log(f"asr-check failed: {type(exc).__name__}: {exc}", level="warning")
+                    raise HTTPException(
+                        status_code=500, detail=f"asr failed: {type(exc).__name__}: {exc}"
+                    )
+        finally:
+            asr_waiting["n"] -= 1
+        return {"text": text, "seconds": round(seconds, 3)}
 
     @app.get("/languages", dependencies=[Depends(api_key_dep)])
     async def languages(request: Request):

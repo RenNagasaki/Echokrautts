@@ -38,6 +38,7 @@ import numpy as np
 
 from . import hfcache, ndjson
 from .config import Config
+from .inline_ref import ConditioningCache, InlineReference
 from .moss_audio import ContractResampler
 from .moss_common import DEFAULT_SAMPLE_RATE, MossWorkerBase
 
@@ -120,6 +121,9 @@ class MossOnnxWorker(MossWorkerBase):
     """One ONNX MOSS runtime, behind the same protocol as every other worker."""
 
     supports_streaming = True
+    # The codec encoder is an ONNX session fed a waveform array, so a reference
+    # can be encoded straight from memory (see _encode_inline).
+    supports_inline_reference = True
 
     def __init__(self, config: Config, device: str):
         hfcache.use_models_dir(config)
@@ -129,6 +133,8 @@ class MossOnnxWorker(MossWorkerBase):
         self.supports_streaming = bool(config.moss_stream)
         self._max_new_frames = int(config.moss_max_new_frames)
         self._resampler = ContractResampler()
+        # Prompt codes of inline references, per voice (RAM only, bounded).
+        self._inline_cache: ConditioningCache = ConditioningCache(config.inline_ref_cache_size)
         # A CPU runtime by design. The GPU measured SLOWER than the CPU for this
         # model — the time goes into per-call overhead, not arithmetic — and
         # leaving the card to the game is the reason MOSS is offered at all.
@@ -183,12 +189,51 @@ class MossOnnxWorker(MossWorkerBase):
         prepared = rt.prepare_synthesis_text(
             text=gen_text, voice="", enable_wetext=False, enable_normalize_tts_text=True
         )
-        prompt_codes = rt.resolve_prompt_audio_codes(voice=None, prompt_audio_path=ref_file)
+        if isinstance(ref_file, InlineReference):
+            prompt_codes = self._inline_cache.get_or_compute(
+                ref_file.voice_id, lambda: self._encode_inline(ref_file)
+            )
+        else:
+            prompt_codes = rt.resolve_prompt_audio_codes(voice=None, prompt_audio_path=ref_file)
         rt.manifest["generation_defaults"]["max_new_frames"] = self._max_new_frames
 
         for text_chunk in rt.split_voice_clone_text(str(prepared["text"]), max_tokens=75):
             rows = rt.build_voice_clone_request_rows(prompt_codes, rt.encode_text(text_chunk))
             yield from self._decode_streaming(rows, sample_rate)
+
+    def _encode_inline(self, ref: InlineReference) -> list[list[int]]:
+        """Prompt codes for an in-memory reference — the vendor's
+        ``encode_reference_audio`` minus its ``torchaudio.load``.
+
+        The vendor method only takes a path; its body is a resample/channel
+        conversion followed by one ``codec_encode`` session run, and both work
+        on arrays. Repeated here (pinned MOSS commit, ``onnx_tts_runtime.py``
+        ``_load_reference_audio`` + ``encode_reference_audio``) rather than
+        written to a temp file, because the reference may be game audio.
+        """
+        import torch  # lazy
+        import torchaudio  # lazy
+
+        rt = self._runtime
+        codec = rt.codec_meta["codec_config"]
+        target_rate = int(codec["sample_rate"])
+        target_channels = int(codec["channels"])
+        waveform = torch.from_numpy(ref.audio.astype("float32", copy=False)).unsqueeze(0)
+        if ref.sample_rate != target_rate:
+            waveform = torchaudio.functional.resample(waveform, ref.sample_rate, target_rate)
+        if target_channels > 1:
+            waveform = waveform.repeat(target_channels, 1)
+        batch = waveform.unsqueeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+        session = rt.sessions["codec_encode"]
+        outputs = session.run(
+            None,
+            {"waveform": batch, "input_lengths": np.asarray([batch.shape[-1]], dtype=np.int32)},
+        )
+        named = dict(zip([o.name for o in session.get_outputs()], outputs))
+        codes = np.asarray(named["audio_codes"], dtype=np.int32)
+        length = int(np.asarray(named["audio_code_lengths"]).reshape(-1)[0])
+        quantizers = int(codec["num_quantizers"])
+        return [[int(codes[0, f, q]) for q in range(quantizers)] for f in range(length)]
 
     def _decode_streaming(self, request_rows, sample_rate: int):
         import onnx_tts_runtime as runtime

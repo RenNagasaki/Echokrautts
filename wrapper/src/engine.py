@@ -21,13 +21,15 @@ import asyncio
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, Callable, Iterator, Optional, Protocol
+from typing import AsyncIterator, Callable, Iterator, Optional, Protocol, Union
 
 import numpy as np
 
 from . import audio_compat, ndjson, selftest
+from .asr import PcmTranscriber, whisper_transcribe
 from .config import Config
 from .gpu_detect import Detection
+from .inline_ref import ConditioningCache, InlineReference, ensure_sentence_end
 from .jobs import CANCELLED, DONE, ERROR, Job, JobRegistry
 from .samples import SampleService
 from .streaming import chunk_text
@@ -41,6 +43,13 @@ class QueueFull(Exception):
 
 class InferenceError(Exception):
     """A worker failed to synthesize a chunk (HTTP 500)."""
+
+
+# What a request clones from: a file in samples/ or an in-memory inline
+# reference (plan game-voice-reference §2.4). Workers receive ``str(path)`` for
+# the former and the :class:`InlineReference` object itself for the latter —
+# an object, not a path, precisely so it can never be mistaken for one.
+Reference = Union[Path, InlineReference]
 
 
 @dataclass
@@ -61,8 +70,12 @@ class WorkerProtocol(Protocol):
     # ``infer`` path (e.g. F5, which returns a whole clip). Accessed via getattr
     # so workers/fakes that omit it default to False.
     supports_streaming: bool
+    # Whether ``ref_file`` may be an :class:`InlineReference` (conditioning from
+    # memory, nothing on disk). Read via getattr, so omitting it means False and
+    # the server answers 501 for inline requests instead of crashing a worker.
+    supports_inline_reference: bool
 
-    def infer(self, ref_file: str, ref_text: str, gen_text: str, nfe_step: int, speed: float, language: Optional[str] = None) -> np.ndarray: ...
+    def infer(self, ref_file: "str | InlineReference", ref_text: str, gen_text: str, nfe_step: int, speed: float, language: Optional[str] = None) -> np.ndarray: ...
     def transcribe(self, audio_path: Path) -> str: ...
     def self_test(self) -> bool: ...
     # Optional (only when supports_streaming): yield float32 audio chunks as they
@@ -75,6 +88,7 @@ class F5TTSWorker:
     """Wraps a single ``f5_tts.api.F5TTS`` instance bound to one device."""
 
     supports_streaming = False  # F5's infer() returns a whole clip, not a stream
+    supports_inline_reference = True
 
     def __init__(self, config: Config, device: str):
         from f5_tts.api import F5TTS  # lazy: heavy import
@@ -83,6 +97,11 @@ class F5TTSWorker:
 
         self.device = device
         self.sample_rate = DEFAULT_SAMPLE_RATE
+        # Prepared inline reference tensors (mono, CPU), per voice. F5 computes
+        # the reference mel inside ``sample()`` on every call, so this saves the
+        # decode/convert step only — F5's conditioning is not separable from
+        # generation the way XTTS latents are.
+        self._inline_cache: ConditioningCache = ConditioningCache(config.inline_ref_cache_size)
         # Load the checkpoint for the wrapper's active language. For finetunes
         # this returns local ckpt/vocab paths (already cached from install).
         spec = resolve_model(config, config.language)
@@ -98,10 +117,12 @@ class F5TTSWorker:
         if isinstance(sr, int) and sr > 0:
             self.sample_rate = sr
 
-    def infer(self, ref_file: str, ref_text: str, gen_text: str, nfe_step: int, speed: float, language: Optional[str] = None) -> np.ndarray:
+    def infer(self, ref_file: "str | InlineReference", ref_text: str, gen_text: str, nfe_step: int, speed: float, language: Optional[str] = None) -> np.ndarray:
         # ``language`` is ignored: an F5 worker is bound to one finetune at load
         # time (one language per process), and the server already rejects a
         # mismatched request before it reaches here. Accepted for protocol parity.
+        if isinstance(ref_file, InlineReference):
+            return self._infer_inline(ref_file, gen_text, nfe_step, speed)
         wav, sr, _spec = self._model.infer(
             ref_file=ref_file,
             ref_text=ref_text or "",
@@ -111,6 +132,52 @@ class F5TTSWorker:
             remove_silence=False,
             show_info=lambda *a, **k: None,
             progress=None,
+        )
+        if isinstance(sr, int) and sr > 0:
+            self.sample_rate = sr
+        return np.asarray(wav, dtype=np.float32)
+
+    def _infer_inline(self, ref: InlineReference, gen_text: str, nfe_step: int, speed: float) -> np.ndarray:
+        """F5 inference from an in-memory reference — no file anywhere.
+
+        ``F5TTS.infer`` cannot be used: its ``preprocess_ref_audio_text`` opens
+        the reference by path and exports a trimmed copy to a
+        ``NamedTemporaryFile`` (f5-tts 1.1.22, ``utils_infer.py``) for EVERY new
+        reference. So this goes one level down to ``infer_batch_process``,
+        which takes ``(tensor, sample_rate)``, and repeats the two things the
+        skipped layers did that matter: the sentence end on ``ref_text`` and the
+        per-batch text budget of ``infer_process``. The silence trimming is
+        deliberately not repeated — the plugin picks and cuts the clips, and
+        trimming here would desync audio from ``ref_text``.
+        """
+        import torch  # lazy
+        from f5_tts.infer.utils_infer import chunk_text as f5_chunk_text
+        from f5_tts.infer.utils_infer import infer_batch_process
+
+        audio = self._inline_cache.get_or_compute(
+            ref.voice_id, lambda: torch.from_numpy(np.ascontiguousarray(ref.audio)).unsqueeze(0)
+        )
+        ref_text = ensure_sentence_end(ref.text)
+        seconds = audio.shape[-1] / ref.sample_rate
+        # Same formula as f5_tts.infer.utils_infer.infer_process.
+        max_chars = int(len(ref_text.encode("utf-8")) / seconds * (22 - seconds) * speed)
+        batches = f5_chunk_text(gen_text, max_chars=max(1, max_chars))
+        if not batches:
+            return np.zeros(0, dtype=np.float32)
+        model = self._model
+        wav, sr, _spec = next(
+            infer_batch_process(
+                (audio, ref.sample_rate),
+                ref_text,
+                batches,
+                model.ema_model,
+                model.vocoder,
+                mel_spec_type=model.mel_spec_type,
+                progress=None,
+                nfe_step=nfe_step,
+                speed=speed,
+                device=model.device,
+            )
         )
         if isinstance(sr, int) and sr > 0:
             self.sample_rate = sr
@@ -204,6 +271,12 @@ def float_to_pcm16(wav: np.ndarray) -> bytes:
     return (arr * 32767.0).astype("<i2").tobytes()
 
 
+def _worker_ref(reference: "Reference") -> "str | InlineReference":
+    """What a worker's ``ref_file`` gets: the path as a string (unchanged
+    contract for file samples) or the in-memory reference object itself."""
+    return reference if isinstance(reference, InlineReference) else str(reference)
+
+
 # Sentinel returned by _pump_next when a streaming worker's generator is done.
 _STREAM_DONE = object()
 
@@ -229,6 +302,7 @@ class Engine:
         jobs: JobRegistry,
         samples: Optional[SampleService] = None,
         worker_factory: Optional[WorkerFactory] = None,
+        asr: Optional[PcmTranscriber] = None,
     ):
         self._config = config
         self._detection = detection
@@ -243,6 +317,9 @@ class Engine:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Sample service shares this engine's transcriber so ASR reuses a worker.
         self.samples = samples or SampleService(config, transcriber=self._transcribe)
+        # In-memory ASR for /asr-check (Whisper via F5, lazy). Injectable so the
+        # suite runs without torch. Serialised by the server, not here.
+        self._asr: PcmTranscriber = asr or whisper_transcribe
 
     # -------------------------------------------------------------- lifecycle
     @property
@@ -252,6 +329,18 @@ class Engine:
     @property
     def queue_depth(self) -> int:
         return max(0, self._pending - self.max_workers)
+
+    @property
+    def supports_inline_reference(self) -> bool:
+        """True only when EVERY worker can condition from memory.
+
+        All-or-nothing because any worker may serve a request. ``False`` makes
+        ``/tts`` answer 501 for inline requests and ``/health`` report it, which
+        is what the plugin checks before it ever sends game audio (plan §5.3).
+        """
+        return bool(self._workers) and all(
+            getattr(w, "supports_inline_reference", False) for w in self._workers
+        )
 
     @property
     def sample_rate(self) -> int:
@@ -339,6 +428,10 @@ class Engine:
             ),
             "workers": self.max_workers,
             "queue": self.queue_depth,
+            # Plan game-voice-reference §2.4/§5.3: the plugin only sends game
+            # audio to a server that says it keeps it in memory.
+            "inline_reference": self.supports_inline_reference,
+            "asr_check": True,
         }
 
     # ----------------------------------------------------------------- ASR
@@ -347,6 +440,10 @@ class Engine:
         if not self._workers:
             return ""
         return self._workers[0].transcribe(audio_path)
+
+    def transcribe_pcm(self, audio: np.ndarray, sample_rate: int, language: Optional[str]) -> str:
+        """In-memory ASR for ``/asr-check`` (blocking; run it in an executor)."""
+        return self._asr(audio, sample_rate, language)
 
     # ------------------------------------------------------------- synthesis
     def admit(self) -> None:
@@ -358,26 +455,36 @@ class Engine:
         self._pending += 1
 
     async def stream(
-        self, job: Job, params: TtsParams, audio_path: Path
+        self, job: Job, params: TtsParams, reference: Reference
     ) -> AsyncIterator[bytes]:
         """Async generator yielding PCM per sentence chunk (SPEC §6).
 
-        Call :meth:`admit` and resolve ``audio_path`` (so 503/400/404 surface
+        Call :meth:`admit` and resolve the reference (so 503/400/404 surface
         before the HTTP 200) *before* iterating this. Resolves ref-text, chunks
         the text, acquires a worker with backpressure, then streams — honoring
         the cancel token and updating progress between chunks.
+
+        ``reference`` is a sample path or an :class:`InlineReference`. The
+        inline one brings its own text (the game text); the sample service —
+        sidecar files, ASR fallback, its transcript cache — is never consulted
+        for it, because that path writes ``.txt`` files next to the audio.
         """
         assert self._loop is not None
-        ref_text = await self._loop.run_in_executor(
-            None, self.samples.resolve_ref_text, audio_path, params.ref_text
-        )
+        if isinstance(reference, InlineReference):
+            ref_text: Optional[str] = reference.text
+            ref_label = reference.label
+        else:
+            ref_text = await self._loop.run_in_executor(
+                None, self.samples.resolve_ref_text, reference, params.ref_text
+            )
+            ref_label = reference.name
 
         chunks = chunk_text(params.text, self._config.max_chars_per_chunk)
         self._jobs.set_total(job, len(chunks))
 
         ndjson.log(
             f"tts request start: job={job.job_id} sample={params.sample} "
-            f"file={audio_path.name} lang={params.language} "
+            f"file={ref_label} lang={params.language} "
             f"chars={len(params.text)} chunks={len(chunks)}"
         )
         # Wall clock for the whole synthesis + total PCM emitted, so we can report
@@ -408,9 +515,9 @@ class Engine:
                 # consumed as one async iterator so cancel checks and the byte /
                 # part / first-audio bookkeeping exist exactly once.
                 source = (
-                    self._stream_chunk(worker, audio_path, ref_text, chunk, params)
+                    self._stream_chunk(worker, reference, ref_text, chunk, params)
                     if streaming
-                    else self._one_shot_chunk(worker, audio_path, ref_text, chunk, params)
+                    else self._one_shot_chunk(worker, reference, ref_text, chunk, params)
                 )
                 try:
                     async for pcm in source:
@@ -476,7 +583,7 @@ class Engine:
     async def _infer_chunk(
         self,
         worker: WorkerProtocol,
-        audio_path: Path,
+        reference: Reference,
         ref_text: Optional[str],
         chunk: str,
         params: TtsParams,
@@ -486,7 +593,7 @@ class Engine:
             wav = await self._loop.run_in_executor(
                 None,
                 worker.infer,
-                str(audio_path),
+                _worker_ref(reference),
                 ref_text or "",
                 chunk,
                 params.nfe_step,
@@ -502,19 +609,19 @@ class Engine:
     async def _one_shot_chunk(
         self,
         worker: WorkerProtocol,
-        audio_path: Path,
+        reference: Reference,
         ref_text: Optional[str],
         chunk: str,
         params: TtsParams,
     ) -> AsyncIterator[bytes]:
         """Adapt the one-shot path (F5) to the same async-iterator shape as
         :meth:`_stream_chunk`, so :meth:`stream` has a single consume loop."""
-        yield await self._infer_chunk(worker, audio_path, ref_text, chunk, params)
+        yield await self._infer_chunk(worker, reference, ref_text, chunk, params)
 
     async def _stream_chunk(
         self,
         worker: WorkerProtocol,
-        audio_path: Path,
+        reference: Reference,
         ref_text: Optional[str],
         chunk: str,
         params: TtsParams,
@@ -528,7 +635,7 @@ class Engine:
         rebuilds the worker exactly like the one-shot path."""
         assert self._loop is not None
         try:
-            gen = worker.infer_stream(str(audio_path), ref_text or "", chunk, params.speed, params.language)
+            gen = worker.infer_stream(_worker_ref(reference), ref_text or "", chunk, params.speed, params.language)
         except Exception as exc:  # noqa: BLE001 — isolate and surface as HTTP 500
             raise InferenceError(f"{type(exc).__name__}: {exc}") from exc
         while True:

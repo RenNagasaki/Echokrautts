@@ -11,7 +11,7 @@ longer exists.)
 ## Build / Test
 - Tooling: `uv` (at `~/.local/bin/uv`) + system Python 3.12. No dotnet here.
 - **Unit tests** (mock torch/f5-tts, run anywhere): `wrapper/.venv-test` with `pytest pytest-asyncio
-  httpx fastapi numpy`, then `.venv-test/Scripts/python -m pytest -q` → **373 passed, 1 skipped** (2026-11-01)
+  httpx fastapi numpy`, then `.venv-test/Scripts/python -m pytest -q` → **411 passed, 3 skipped** (2026-11-08, macOS; dort zusätzlich 5 vorbestehende Fehler in `test_bootstrap_rocm_windows.py`, weil der Bootstrap darwin ablehnt)
   (skip = symlink test, Windows privilege). Suite must stay green.
 - **Runtime venv** (`wrapper/.venv`, gitignored): created by the bootstrap with torch+f5-tts.
 
@@ -270,6 +270,30 @@ longer exists.)
   ⚠ Folge: zwei Starter im selben Ordner laufen nicht mehr parallel (auch nicht auf verschiedenen
   Ports). Der zweite beendet den ersten. Nie fatal: Ein fehlgeschlagener Sweep wird nur geloggt.
   Live geprüft: Übernahme eines echten Lock-Halters in 0,25 s.
+- `src/inline_ref.py` — **Inline-Referenz (2026-11-08, Plan `echokraut/docs/plans/game-voice-reference.md`
+  §2.4, Phase 3).** `/tts` nimmt statt `sample` auch `ref_audio` (base64 PCM s16le 24 kHz mono) +
+  `ref_text` (Pflicht, Spieltext) + optional `ref_ids`. `build_reference` → `InlineReference`
+  (`voice_id` = sha256 der Clip-IDs, ohne IDs von Audio+Text; Text und Audio NICHT im repr). **Nur RAM:**
+  kein `samples/`, kein Temp-File, die `SampleService` (Sidecar, ASR-Fallback, Transkript-Cache) wird
+  für Inline nie gefragt. Der Worker bekommt das OBJEKT statt `str(path)` (`engine._worker_ref`) und
+  meldet `supports_inline_reference`; `Engine.supports_inline_reference` ist alles-oder-nichts über den
+  Pool → `/health inline_reference`, sonst `/tts` 501. `ConditioningCache` = LRU je Worker
+  (`inline_ref_cache_size`). Grenzen `inline_ref_max_seconds` (15 s; F5s Budget `22 - ref_s` würde bei
+  langer Referenz negativ).
+  **Je Engine geprüft (Quellen gelesen, nicht live):** ⚠ **F5 `F5TTS.infer` schreibt bei JEDER neuen
+  Referenz eine Temp-WAV** (`preprocess_ref_audio_text`, f5-tts 1.1.22) → `F5TTSWorker._infer_inline`
+  ruft `infer_batch_process((tensor, sr), …)` direkt und wiederholt nur Satzende + `max_chars`-Formel
+  von `infer_process` (kein Stille-Trimmen: würde Audio und Text entkoppeln). **XTTS**
+  `_inline_latents` baut `get_conditioning_latents` aus `get_speaker_embedding` +
+  `get_gpt_cond_latents` (Tensoren, 22050 Hz, Längen 6/6 = coqui-Defaults). **MOSS ONNX**
+  `_encode_inline` = Vendor-`encode_reference_audio` ohne `torchaudio.load` (eine `codec_encode`-Session).
+  **MOSS PyTorch: NICHT unterstützt** — `NanoTTSService.synthesize_stream` verlangt einen existierenden
+  Pfad. **Live (GPU) noch ungetestet.**
+- `src/asr.py` — `whisper_transcribe(audio, sr, lang)` für **`POST /asr-check`** (Audio rein, `{text,
+  seconds}` raus, nichts gespeichert, ≤ 30 s). Nutzt F5s Whisper-Pipeline mit `{"raw", "sampling_rate"}`
+  — NIE `F5TTSWorker.transcribe` (geht über die Temp-WAV). In der Engine injizierbar (`asr=`), im
+  Server per `asyncio.Lock` serialisiert (Pipeline ist global, nicht threadsicher; asyncio statt
+  Thread-Lock, damit Wartende keine Executor-Threads der TTS-Worker blockieren), 503 ab `max_queue`.
 - `src/procutil.py` — subprocess helper with `CREATE_NO_WINDOW` (no console flashes, SPEC §8.5).
 - `src/streaming.py` — `chunk_text()` sentence chunking (pure, model-free).
 - `src/samples.py` — `SampleService`: basename-only resolution + traversal guard. A voice is EITHER a
@@ -376,7 +400,7 @@ longer exists.)
   bookkeeping and the cancel check exist exactly once.
 - `src/server.py` — `create_app(config, engine=None)`: lifespan builds+starts engine, emits `ready`,
   parent-PID watchdog. Endpoints: `/tts` (StreamingResponse), `/samples`, `/languages`, `/cancel/{id}`,
-  `/jobs/{id}`, `/health`, `/shutdown`, `/` (web UI). Optional Bearer `api_key`.
+  `/jobs/{id}`, `/health`, `/asr-check`, `/shutdown`, `/` (web UI). Optional Bearer `api_key`.
   - **`TtsRequest.format`** (`"pcm"` default · `"wav"`): wav **buffers the whole clip** and prepends
     a RIFF header (`src/wav.py`), because a browser cannot play headerless PCM. Streaming is given
     up knowingly in that mode — a correct header needs the total length, and the alternative (a

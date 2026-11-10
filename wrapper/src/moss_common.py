@@ -34,6 +34,11 @@ class MossWorkerBase:
 
     #: Overridden per instance from ``config.moss_stream`` by both runtimes.
     supports_streaming = True
+    #: False here: the PyTorch runtime takes the reference only as a PATH, deep
+    #: inside ``NanoTTSService.synthesize_stream`` (it resolves it and checks it
+    #: exists), so an in-memory reference would need a file. The ONNX runtime
+    #: exposes the codec session and overrides this.
+    supports_inline_reference = False
     sample_rate = DEFAULT_SAMPLE_RATE
 
     def infer_stream(

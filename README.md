@@ -307,13 +307,25 @@ no CDN, works offline and inside the container.
 | `GET /`              | The built-in [web UI](#web-ui). The only endpoint never behind the API key. |
 | `POST /cancel/{id}`  | Cancel a running job.                                              |
 | `GET /jobs/{id}`     | Live progress (`sentences_done`/`sentences_total`/`percent`).      |
-| `GET /health`        | Backend/device/worker/queue status, plus `rate_limit` usage.       |
+| `POST /asr-check`    | `{"audio": <base64 PCM s16le 24 kHz mono>, "language"?}` → `{"text", "seconds"}`. Whisper on the request buffer, nothing stored. At most 30 s, one at a time (503 beyond `max_queue` waiting). |
+| `GET /health`        | Backend/device/worker/queue status, `rate_limit` usage, `inline_reference` (inline `ref_audio` supported) and `asr_check`. |
 | `POST /shutdown`     | Graceful shutdown.                                                 |
 
-**Request body:** `sample` (voice name, required) and `text`, plus optional `language`, `ref_text`,
-`speed` (0 < s ≤ 3) and `nfe_step` (4 … 128, default 32). Both numeric fields are bounded because
+**Request body:** `text` and **exactly one** reference — `sample` (voice name) or an inline
+reference (below) — plus optional `language`, `ref_text`, `speed` (0 < s ≤ 3) and `nfe_step`
+(4 … 128, default 32). Both numeric fields are bounded because
 they reach the engine unchanged: a `speed` of 0 is undefined rather than slow, and a huge `nfe_step`
 holds a worker for minutes — the pool hands out exactly one per request.
+
+**Inline reference** (`ref_audio`, for the Echokraut plugin's opt-in game-voice reference): send
+`ref_audio` (base64 PCM s16le, **24 kHz mono**, 1 … `inline_ref_max_seconds` = 15 s) plus `ref_text`
+(**required**, the clip's transcript — no ASR fills it in) and optionally `ref_ids` (ids of the
+clips it was cut from; their hash keys the conditioning cache, otherwise audio + text are hashed).
+The audio is held **in RAM only** — never written to `samples/`, never a temp file — and the
+per-voice conditioning (XTTS latents, MOSS prompt codes, F5 reference tensor) is cached per worker,
+least recently used out (`inline_ref_cache_size`, default 16). F5, XTTS and MOSS on ONNX support it;
+**MOSS on the PyTorch runtime does not** (its vendor API takes only a path) and answers `501`, with
+`/health` reporting `inline_reference: false`.
 
 **`nfe_step` is the cheapest speed lever, and it is F5-only.** It is the number of flow-matching
 passes over the whole clip, so halving it roughly halves the GPU work: on an RTX 5090 the same

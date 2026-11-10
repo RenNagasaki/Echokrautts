@@ -266,6 +266,16 @@ class Config:
     # or slower). F5 ignores this. Experimental — verify audio quality per voice.
     xtts_fp16: bool = False
     asr_for_missing_ref_text: bool = True
+    # Inline references (/tts with ``ref_audio``, plan game-voice-reference
+    # §2.4): held in RAM only, never written. The length bound is the plan's
+    # hard range for a usable clip (3-15 s) with the lower end left to the
+    # caller; it is also what keeps F5 sane — its text budget per batch is
+    # ``(22 - ref_seconds)``, which goes negative for a long reference.
+    inline_ref_max_seconds: float = 15.0
+    # Conditioning entries (XTTS latents, F5 reference tensor, MOSS prompt
+    # codes) kept PER WORKER for inline references, least recently used out.
+    # 0 = no cache. A conversation reuses one voice, so a handful is plenty.
+    inline_ref_cache_size: int = 16
     allowed_sample_ext: list[str] = field(
         default_factory=lambda: [".wav", ".flac", ".mp3"]
     )
@@ -325,9 +335,10 @@ def _coerce(name: str, raw: Any, current: Any) -> Any:
         "rate_limit_per_ip_per_hour",
         "moss_max_new_frames",
         "moss_onnx_threads",
+        "inline_ref_cache_size",
     ):
         return int(raw)
-    if name in ("vram_reserve_gb", "per_job_gb"):
+    if name in ("vram_reserve_gb", "per_job_gb", "inline_ref_max_seconds"):
         return float(raw)
     if name in (
         "asr_for_missing_ref_text",

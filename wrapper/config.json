@@ -57,6 +57,8 @@
     "deps": ["sentencepiece"]
   },
   "asr_for_missing_ref_text": true,
+  "inline_ref_max_seconds": 15.0,
+  "inline_ref_cache_size": 16,
   "allowed_sample_ext": [".wav", ".flac", ".mp3"],
   "hf_endpoint": null,
   "torch_index_override": null,

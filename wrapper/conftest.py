@@ -26,16 +26,19 @@ class FakeWorker:
 
     supports_streaming = False
 
-    def __init__(self, sample_rate: int = 24000, fail: bool = False):
+    def __init__(self, sample_rate: int = 24000, fail: bool = False, inline: bool = True):
         self.sample_rate = sample_rate
         self.device = "cpu"
         self._fail = fail
+        self.supports_inline_reference = inline
         self.infer_calls = 0
         self.languages: list = []  # every language passed to infer/infer_stream
+        self.refs: list = []  # every (ref_file, ref_text) passed to infer/infer_stream
 
     def infer(self, ref_file, ref_text, gen_text, nfe_step, speed, language=None):
         self.infer_calls += 1
         self.languages.append(language)
+        self.refs.append((ref_file, ref_text))
         if self._fail:
             raise RuntimeError("simulated CUDA OOM")
         # 50 ms of silence, length proportional to text so output varies.
@@ -58,6 +61,7 @@ class FakeStreamWorker(FakeWorker):
     def infer_stream(self, ref_file, ref_text, gen_text, speed, language=None):
         self.infer_calls += 1
         self.languages.append(language)
+        self.refs.append((ref_file, ref_text))
         if self._fail:
             raise RuntimeError("simulated CUDA OOM")
         n = max(1, int(0.02 * self.sample_rate))
@@ -93,7 +97,13 @@ def config(tmp_path: Path, samples_dir: Path) -> Config:
 
 
 def make_engine(
-    config: Config, *, fail: bool = False, workers: int = 1, streaming: bool = False
+    config: Config,
+    *,
+    fail: bool = False,
+    workers: int = 1,
+    streaming: bool = False,
+    inline: bool = True,
+    asr=None,
 ) -> Engine:
     jobs = JobRegistry()
     det = cpu_detection(max_workers_hint=workers)
@@ -102,5 +112,7 @@ def make_engine(
         config,
         det,
         jobs,
-        worker_factory=lambda i, d: worker_cls(fail=fail),
+        worker_factory=lambda i, d: worker_cls(fail=fail, inline=inline),
+        # Never the real Whisper in tests: a fake unless a test passes one.
+        asr=asr or (lambda audio, sr, lang: "fake asr"),
     )

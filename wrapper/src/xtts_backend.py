@@ -29,10 +29,19 @@ import numpy as np
 
 from . import hfcache, ndjson, progress, selftest
 from .config import Config, load_config
+from .inline_ref import ConditioningCache, InlineReference
 
 # Coqui model id for XTTS-v2 (multilingual, multi-dataset).
 XTTS_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
 DEFAULT_SAMPLE_RATE = 24000  # XTTS-v2 output rate
+
+# Rate coqui's ``get_conditioning_latents`` loads references at (``load_sr``)
+# and the reference lengths it uses by default. The inline path repeats that
+# call from a tensor, so it must use the same numbers or an inline voice would
+# condition differently from the same audio as a file.
+XTTS_LOAD_SR = 22050
+XTTS_GPT_COND_LEN = 6
+XTTS_GPT_COND_CHUNK_LEN = 6
 
 # ISO codes XTTS-v2 accepts at inference. Unlike F5 (one finetune per language,
 # fixed at startup), XTTS is natively multilingual — so the per-request
@@ -196,6 +205,9 @@ class XTTSWorker:
     """Wraps a single Coqui ``Xtts`` model bound to one device and language."""
 
     supports_streaming = True  # XTTS exposes token streaming via inference_stream
+    # Latents can be computed from a tensor (get_speaker_embedding /
+    # get_gpt_cond_latents), so inline references never need a file.
+    supports_inline_reference = True
 
     def __init__(self, config: Config, device: str):
         import torch  # noqa: F401  lazy: heavy import (ensures torch is present)
@@ -209,6 +221,8 @@ class XTTSWorker:
         # (en/de/fr/ja) that match the wrapper's language keys directly.
         self._lang = config.language
         self._cond_cache: dict[str, tuple] = {}
+        # Inline references: bounded (keys come from requests), RAM only.
+        self._inline_cache: ConditioningCache = ConditioningCache(config.inline_ref_cache_size)
 
         model_dir = _resolve_model_dir(config)
         xtts_config = XttsConfig()
@@ -235,21 +249,53 @@ class XTTSWorker:
         if isinstance(sr, int) and sr > 0:
             self.sample_rate = sr
 
-    def _conditioning(self, ref_file: str) -> tuple:
-        """(gpt_cond_latent, speaker_embedding) for a sample, cached by path.
+    def _conditioning(self, ref_file: "str | InlineReference") -> tuple:
+        """(gpt_cond_latent, speaker_embedding) for a sample, cached by path —
+        or, for an inline reference, by its voice id in a bounded RAM cache.
 
         Under fp16 the latents come out of the float32 front-end (see
         :data:`FP16_FLOAT32_MODULES`) and must be cast to half before they meet
         the half-precision GPT / vocoder at inference time.
         """
+        if isinstance(ref_file, InlineReference):
+            return self._inline_cache.get_or_compute(
+                ref_file.voice_id, lambda: self._to_model_dtype(self._inline_latents(ref_file))
+            )
         cached = self._cond_cache.get(ref_file)
         if cached is not None:
             return cached
-        latents = self._model.get_conditioning_latents(audio_path=[ref_file])
-        if self._fp16:
-            latents = tuple(t.half() if hasattr(t, "half") else t for t in latents)
+        latents = self._to_model_dtype(self._model.get_conditioning_latents(audio_path=[ref_file]))
         self._cond_cache[ref_file] = latents
         return latents
+
+    def _to_model_dtype(self, latents: tuple) -> tuple:
+        if self._fp16:
+            return tuple(t.half() if hasattr(t, "half") else t for t in latents)
+        return latents
+
+    def _inline_latents(self, ref: InlineReference) -> tuple:
+        """``get_conditioning_latents`` for ONE in-memory clip, without a file.
+
+        coqui's method only takes paths (it calls ``torchaudio.load``); the two
+        methods it is built from take tensors. This repeats its body for a
+        single reference with its defaults (no trim, no normalisation): mono at
+        ``XTTS_LOAD_SR``, clipped to [-1, 1], speaker embedding from the clip,
+        GPT latents from the same clip. With one clip its mean over speaker
+        embeddings is the embedding itself.
+        """
+        import torch  # lazy
+        import torchaudio  # lazy
+
+        audio = torch.from_numpy(ref.audio.astype("float32", copy=False)).unsqueeze(0)
+        if ref.sample_rate != XTTS_LOAD_SR:
+            audio = torchaudio.functional.resample(audio, ref.sample_rate, XTTS_LOAD_SR)
+        audio = audio.clip(-1, 1).to(self._model.device)
+        with torch.inference_mode():
+            speaker_embedding = self._model.get_speaker_embedding(audio, XTTS_LOAD_SR)
+            gpt_cond_latents = self._model.get_gpt_cond_latents(
+                audio, XTTS_LOAD_SR, length=XTTS_GPT_COND_LEN, chunk_length=XTTS_GPT_COND_CHUNK_LEN
+            )
+        return gpt_cond_latents, speaker_embedding
 
     def infer(
         self,
