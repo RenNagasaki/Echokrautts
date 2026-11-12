@@ -27,7 +27,7 @@ from pathlib import Path
 
 from . import ndjson, wav
 from .config import Config, load_config
-from .engine import Engine, QueueFull, Reference, TtsParams
+from .engine import Engine, EngineFailed, QueueFull, Reference, TtsParams
 from .gpu_detect import detect_backend
 from .inline_ref import (
     INLINE_SAMPLE_RATE,
@@ -325,7 +325,7 @@ def create_app(
             )
         try:
             eng.admit()
-        except QueueFull as exc:
+        except (QueueFull, EngineFailed) as exc:
             raise HTTPException(status_code=503, detail=str(exc))
 
         job = jobs.create()

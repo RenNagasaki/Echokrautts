@@ -11,7 +11,9 @@ longer exists.)
 ## Build / Test
 - Tooling: `uv` (at `~/.local/bin/uv`) + system Python 3.12. No dotnet here.
 - **Unit tests** (mock torch/f5-tts, run anywhere): `wrapper/.venv-test` with `pytest pytest-asyncio
-  httpx fastapi numpy`, then `.venv-test/Scripts/python -m pytest -q` → **411 passed, 3 skipped** (2026-11-08, macOS; dort zusätzlich 5 vorbestehende Fehler in `test_bootstrap_rocm_windows.py`, weil der Bootstrap darwin ablehnt)
+  httpx fastapi numpy`, then `.venv-test/Scripts/python -m pytest -q` → **437 passed, 3 skipped** (2026-11-12; auf macOS fallen 5 Tests in `test_bootstrap_rocm_windows.py` vorbestehend rot, weil der Bootstrap darwin ablehnt)
+- **Prüfkommando: `node .claude/verify.js`** (gitignored, maschinen-lokal) — ruft die Suite im
+  `.venv-test` auf und lässt auf macOS genau `test_bootstrap_rocm_windows.py` aus (Grund oben).
   (skip = symlink test, Windows privilege). Suite must stay green.
 - **Runtime venv** (`wrapper/.venv`, gitignored): created by the bootstrap with torch+f5-tts.
 
@@ -381,6 +383,20 @@ longer exists.)
   Default is therefore `1`; `null` restores the old auto behaviour (VRAM-derived, cap 4). The value
   is a **ceiling**: `_apply_worker_hint` still lowers it when free VRAM says so.
 - `src/jobs.py` — `JobRegistry`/`Job`: cancel events, progress, thread-safe.
+- **Fatal device errors end the process (2026-11-12).** After `CUDA error: device-side assert
+  triggered` (or illegal memory access / unspecified launch failure / HIP error) the CUDA context of
+  the **whole process** is dead: the in-process `_rebuild_worker` always failed and every later
+  request answered 500 (User-Log 2026-11-08: 543 follow-up errors). `is_fatal_device_error(exc)`
+  (walks the `__cause__` chain, excludes "out of memory") decides; on a hit `stream()` does **not**
+  rebuild but calls `_enter_fatal`: one `error` NDJSON event with `fatal: true`, `health()` →
+  `status: "failed"` + `fatal_error`, `admit()` raises `EngineFailed` (→ HTTP 503), then after
+  `FATAL_EXIT_DELAY_S` (1 s) `_hard_exit` → `os._exit(EXIT_RESTART_REQUIRED = 75)`. `os._exit`
+  on purpose: a graceful uvicorn shutdown exits 0 (host can't tell crash from stop) and tearing
+  down a broken CUDA context can hang. The code reaches the host unchanged (`step_serve` →
+  `bootstrap.main`, `uv run`, `install_linux.sh` uses `exec`). **EchokrautLocalInstaller restarts
+  on exactly 75** (`WrapperRestartPolicy`, max 3 per 15 min) — keep both constants in sync.
+  Engine takes `on_fatal` (injectable; tests pass a recorder). Tests: `tests/test_fatal_device_error.py`.
+  The *cause* of the fp16 `Indexing.cu` assert is a separate open item.
 - `src/engine.py` — `Engine`: worker pool (model loaded once), `admit()` (503 backpressure) +
   `stream()` (per-chunk PCM, cancel checks, worker rebuild on crash). `worker_factory` injectable
   for tests; `_default_factory` picks `F5TTSWorker` vs `XTTSWorker` by `config.tts_backend` (XTTS

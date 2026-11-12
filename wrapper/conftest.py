@@ -26,10 +26,17 @@ class FakeWorker:
 
     supports_streaming = False
 
-    def __init__(self, sample_rate: int = 24000, fail: bool = False, inline: bool = True):
+    def __init__(
+        self,
+        sample_rate: int = 24000,
+        fail: bool = False,
+        inline: bool = True,
+        fail_message: str = "simulated CUDA OOM",
+    ):
         self.sample_rate = sample_rate
         self.device = "cpu"
         self._fail = fail
+        self._fail_message = fail_message
         self.supports_inline_reference = inline
         self.infer_calls = 0
         self.languages: list = []  # every language passed to infer/infer_stream
@@ -40,7 +47,7 @@ class FakeWorker:
         self.languages.append(language)
         self.refs.append((ref_file, ref_text))
         if self._fail:
-            raise RuntimeError("simulated CUDA OOM")
+            raise RuntimeError(self._fail_message)
         # 50 ms of silence, length proportional to text so output varies.
         n = max(1, int(0.05 * self.sample_rate))
         return np.zeros(n, dtype=np.float32)
@@ -63,7 +70,7 @@ class FakeStreamWorker(FakeWorker):
         self.languages.append(language)
         self.refs.append((ref_file, ref_text))
         if self._fail:
-            raise RuntimeError("simulated CUDA OOM")
+            raise RuntimeError(self._fail_message)
         n = max(1, int(0.02 * self.sample_rate))
         for _ in range(self.PARTS_PER_CHUNK):
             yield np.zeros(n, dtype=np.float32)
@@ -104,6 +111,8 @@ def make_engine(
     streaming: bool = False,
     inline: bool = True,
     asr=None,
+    fail_message: str = "simulated CUDA OOM",
+    on_fatal=None,
 ) -> Engine:
     jobs = JobRegistry()
     det = cpu_detection(max_workers_hint=workers)
@@ -112,7 +121,8 @@ def make_engine(
         config,
         det,
         jobs,
-        worker_factory=lambda i, d: worker_cls(fail=fail, inline=inline),
+        worker_factory=lambda i, d: worker_cls(fail=fail, inline=inline, fail_message=fail_message),
         # Never the real Whisper in tests: a fake unless a test passes one.
         asr=asr or (lambda audio, sr, lang: "fake asr"),
+        on_fatal=on_fatal or (lambda: None),
     )

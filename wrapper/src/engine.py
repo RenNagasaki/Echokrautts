@@ -8,6 +8,10 @@ a ``max_queue`` cap (→ HTTP 503).
 
 Crash isolation: a failed inference becomes an :class:`InferenceError` (HTTP 500)
 and the offending worker is re-instantiated; the server process keeps running.
+Exception: a fatal device error (CUDA "device-side assert", illegal memory
+access, …) poisons the whole process's CUDA context, so no in-process rebuild can
+work. The engine then refuses new work (:class:`EngineFailed`, HTTP 503) and the
+process exits with :data:`EXIT_RESTART_REQUIRED` so the host starts a fresh one.
 DirectML/XPU workers run a self-test at startup and silently fall back to CPU if
 their op-coverage is insufficient.
 
@@ -18,6 +22,9 @@ package — and the unit test suite — import without those heavy deps installe
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +50,69 @@ class QueueFull(Exception):
 
 class InferenceError(Exception):
     """A worker failed to synthesize a chunk (HTTP 500)."""
+
+
+class EngineFailed(Exception):
+    """The engine hit a fatal device error and is about to exit (HTTP 503)."""
+
+
+# Exit code after a fatal device error: EX_TEMPFAIL ("temporary failure, retry").
+# The host (EchokrautLocalInstaller) restarts the wrapper on exactly this code;
+# keep both sides in sync (installer Constants.ECHOKRAUTTS_EXIT_RESTART_REQUIRED).
+EXIT_RESTART_REQUIRED = 75
+
+# Grace period between the fatal error and the hard exit, so the failing
+# request's error and the NDJSON event still leave the process.
+FATAL_EXIT_DELAY_S = 1.0
+
+# Substrings (lower-case) of errors after which the CUDA context of THIS process
+# is unusable for good: every later kernel launch fails with the same error, and
+# building a new worker in-process fails too (User-Log 2026-11-08: 543 follow-up
+# 500s after one "device-side assert triggered"). A plain out-of-memory is NOT on
+# this list — it is recoverable and handled by the normal worker rebuild.
+_FATAL_DEVICE_MARKERS = (
+    "device-side assert",
+    "illegal memory access",
+    "unspecified launch failure",
+    "cuda error:",
+    "cudaerror",
+    "hip error:",  # ROCm reports the same faults as "HIP error: …"
+)
+_RECOVERABLE_DEVICE_MARKERS = ("out of memory",)
+
+
+def is_fatal_device_error(exc: BaseException) -> bool:
+    """True when ``exc`` (or anything in its cause/context chain) is a device
+    fault that leaves the process's CUDA/HIP context permanently broken.
+
+    Walks ``__cause__``/``__context__`` because the engine wraps worker errors
+    in :class:`InferenceError`. Out-of-memory errors are excluded even when they
+    are phrased as "CUDA error: out of memory" — those are recoverable."""
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = f"{type(current).__name__}: {current}".lower()
+        if any(m in text for m in _FATAL_DEVICE_MARKERS) and not any(
+            m in text for m in _RECOVERABLE_DEVICE_MARKERS
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _hard_exit(code: int = EXIT_RESTART_REQUIRED) -> None:
+    """Leave the process NOW, with ``code``.
+
+    ``os._exit`` on purpose: a graceful uvicorn shutdown would exit with 0 (the
+    host could not tell a crash from a stop), and tearing down a broken CUDA
+    context can hang or raise in atexit/finalizers."""
+    with contextlib.suppress(Exception):
+        ndjson.shutdown()
+    with contextlib.suppress(Exception):
+        sys.stdout.flush()
+        sys.stderr.flush()
+    os._exit(code)
 
 
 # What a request clones from: a file in samples/ or an in-memory inline
@@ -303,6 +373,7 @@ class Engine:
         samples: Optional[SampleService] = None,
         worker_factory: Optional[WorkerFactory] = None,
         asr: Optional[PcmTranscriber] = None,
+        on_fatal: Optional[Callable[[], None]] = None,
     ):
         self._config = config
         self._detection = detection
@@ -320,6 +391,11 @@ class Engine:
         # In-memory ASR for /asr-check (Whisper via F5, lazy). Injectable so the
         # suite runs without torch. Serialised by the server, not here.
         self._asr: PcmTranscriber = asr or whisper_transcribe
+        # Set once a fatal device error happened; the process is going down.
+        self._fatal: Optional[str] = None
+        # What to do after a fatal device error. Default: hard exit with
+        # EXIT_RESTART_REQUIRED after a short grace period. Injectable for tests.
+        self._on_fatal: Callable[[], None] = on_fatal or self._schedule_exit
 
     # -------------------------------------------------------------- lifecycle
     @property
@@ -415,7 +491,8 @@ class Engine:
 
     def health(self) -> dict:
         return {
-            "status": "ok",
+            "status": "failed" if self._fatal else "ok",
+            "fatal_error": self._fatal,
             "language": self._config.language,
             "tts_backend": self._config.tts_backend,
             "backend": self.backend,
@@ -449,7 +526,12 @@ class Engine:
     def admit(self) -> None:
         """Admission control (SPEC §9). Raises :class:`QueueFull` (503) or counts
         the request as pending. Must be paired with a single :meth:`stream` call,
-        whose ``finally`` releases the pending slot."""
+        whose ``finally`` releases the pending slot.
+
+        Raises :class:`EngineFailed` (503) once a fatal device error happened —
+        the process is about to exit and the host restarts it."""
+        if self._fatal is not None:
+            raise EngineFailed(f"engine failed, restarting: {self._fatal}")
         if self._pending >= self.max_workers + self._config.max_queue:
             raise QueueFull("inference queue is full")
         self._pending += 1
@@ -535,10 +617,16 @@ class Engine:
                     # the underlying error (which lives in the HTTP 500 / job
                     # state) is invisible to whoever watches the process.
                     ndjson.log(f"inference failed: {exc}", level="warning")
+                    self._jobs.finish(job, ERROR, str(exc))
+                    if is_fatal_device_error(exc):
+                        # The CUDA context is dead for the whole process: a
+                        # rebuild here always fails and every later request
+                        # would 500. Exit so the host starts a fresh process.
+                        self._enter_fatal(str(exc))
+                        raise
                     # Isolate the crash: swap the dead worker for a fresh one so
                     # `finally` returns a healthy worker to the pool (SPEC §9).
                     worker = await self._rebuild_worker(worker)
-                    self._jobs.finish(job, ERROR, str(exc))
                     raise
                 self._jobs.advance(job)
 
@@ -646,6 +734,25 @@ class Engine:
             if part is _STREAM_DONE:
                 return
             yield float_to_pcm16(part)  # type: ignore[arg-type]
+
+    def _enter_fatal(self, message: str) -> None:
+        """Mark the engine failed (idempotent), report it, and trigger the exit."""
+        if self._fatal is not None:
+            return
+        self._fatal = message
+        ndjson.error(
+            f"fatal device error, the GPU context of this process is unusable — "
+            f"exiting with code {EXIT_RESTART_REQUIRED} so the host restarts the "
+            f"wrapper: {message}",
+            fatal=True,
+        )
+        self._on_fatal()
+
+    def _schedule_exit(self) -> None:
+        if self._loop is not None:
+            self._loop.call_later(FATAL_EXIT_DELAY_S, _hard_exit, EXIT_RESTART_REQUIRED)
+        else:  # pragma: no cover — stream() always runs on a started engine
+            _hard_exit(EXIT_RESTART_REQUIRED)
 
     async def _rebuild_worker(self, dead: WorkerProtocol) -> WorkerProtocol:
         """Replace a crashed worker instance in place, returning the fresh one.

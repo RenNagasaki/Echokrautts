@@ -352,3 +352,25 @@ def test_tts_moss_rejects_an_untrained_language(config):
         r = c.post("/tts", json={"sample": "anna_de.wav", "text": "Hi.", "language": "zh-cn"})
     assert r.status_code == 400
     assert "MOSS-TTS-Nano" in r.json()["detail"]
+
+
+def test_tts_answers_503_after_a_fatal_device_error(config):
+    # After "device-side assert" the process is about to exit for a restart;
+    # new requests get 503 ("retry shortly"), not another 500 from a dead GPU.
+    calls = []
+    engine = make_engine(
+        config,
+        fail=True,
+        fail_message="CUDA error: device-side assert triggered",
+        on_fatal=lambda: calls.append("exit"),
+    )
+    app = create_app(config=config, engine=engine)
+    body = {"sample": "anna_de.wav", "text": "Hallo."}
+    with TestClient(app, raise_server_exceptions=False) as c:
+        c.post("/tts", json=body)  # the request that hits the fault
+        r = c.post("/tts", json=body)
+        health = c.get("/health").json()
+    assert calls == ["exit"]
+    assert r.status_code == 503
+    assert "device-side assert" in r.json()["detail"]
+    assert health["status"] == "failed"
