@@ -1,0 +1,52 @@
+# ============================================================================
+#  Echokrautts — one-click deploy (AMD / ROCm).
+#
+#    docker compose -f docker-compose.rocm.yml up -d
+#
+#  Standalone file, like the CPU one: AMD GPUs are not passed through with
+#  `--gpus`, but by handing the container the two kernel devices below, so
+#  layering it over the NVIDIA compose file would not work.
+#
+#  Host requirements:
+#    * Linux with the amdgpu kernel driver (ROCm userspace is inside the image)
+#    * Windows: run this inside WSL2 with Docker Desktop — AMD supports ROCm on
+#      WSL2 for RX 9070/XT and RX 7900 XTX/XT with a recent Adrenalin driver.
+#
+#  This variant ships torch 2.8.0+rocm6.4 (the other images use 2.7.0): ROCm 6.4
+#  is the oldest index that covers RDNA4 (RX 9000), and 2.8 is the newest
+#  torchaudio that still decodes without torchcodec/FFmpeg.
+# ============================================================================
+services:
+  echokrautts:
+    image: ghcr.io/rennagasaki/echokrautts:${ECHOKRAUTTS_TAG:-latest}-rocm
+    container_name: echokrautts
+    restart: unless-stopped
+    ports:
+      - "${ECHOKRAUTTS_PORT:-8765}:8765"
+    # /dev/kfd is the ROCm compute device, /dev/dri the render nodes. Both are
+    # required; without them the container sees no GPU at all.
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      F5W_TTS_BACKEND: "${F5W_TTS_BACKEND:-xtts}"
+      F5W_LANGUAGE: "${F5W_LANGUAGE:-de}"
+      # The image already forces the ROCm backend (F5W_GPU_BACKEND=rocm) because
+      # a slim container has no rocminfo for detection to find. Set
+      # F5W_GPU_BACKEND=cpu here to fall back deliberately.
+      #
+      # fp16 is gated on a CUDA device — ROCm reports itself as CUDA, so this
+      # takes effect. Unverified on AMD; turn it off if audio quality suffers.
+      F5W_XTTS_FP16: "${F5W_XTTS_FP16:-false}"
+      # Some consumer cards need their gfx version spoofed to the nearest
+      # supported one (e.g. 11.0.0 for RDNA3). Uncomment if ROCm refuses the GPU.
+      # HSA_OVERRIDE_GFX_VERSION: "11.0.0"
+      # F5W_API_KEY: "change-me"
+    volumes:
+      - ./samples:/data/samples
+      - ./models:/data/models

@@ -1,0 +1,89 @@
+{
+  "host": "0.0.0.0",
+  "port": 8765,
+  "parent_pid": null,
+  "api_key": null,
+  "python_version": "3.11",
+  "torch_version": "2.7.0",
+  "torchaudio_version": "2.7.0",
+  "language": "de",
+  "languages": {
+    "en": { "arch": "F5TTS_v1_Base" },
+    "de": { "arch": "F5TTS_Base", "hf_repo": "hvoss-techfak/F5-TTS-German", "ckpt_file": "model_f5tts_german.safetensors", "vocab_file": "vocab.txt" },
+    "fr": { "arch": "F5TTS_Base", "hf_repo": "RASPIAUDIO/F5-French-MixedSpeakers-reduced", "ckpt_file": "model_last_reduced.pt", "vocab_file": "vocab.txt" },
+    "ja": { "arch": "F5TTS_Base", "hf_repo": "Jmica/F5TTS", "ckpt_file": "JA_21999120/model_21999120.pt", "vocab_file": "JA_21999120/vocab_japanese.txt" }
+  },
+  "gpu_backend": "auto",
+  "rocm_windows": {
+    "python": "3.12",
+    "torch_version": "2.9.1",
+    "gpu_pattern": "RX\\s*9\\d{3}|RX\\s*7[89]\\d{2}|Radeon\\s+Pro\\s+W7|Radeon\\s+AI\\s+PRO",
+    "wheels": [
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm-7.2.1.tar.gz"
+    ],
+    "torch_wheels": [
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchaudio-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+      "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl"
+    ]
+  },
+  "samples_dir": "samples",
+  "voicepack_auto_download": true,
+  "voicepack_repo": "RenNagasaki/Echokraut",
+  "voicepack_tag_prefix": "EK-VoicePack-",
+  "models_dir": "models",
+  "max_workers": 1,
+  "vram_reserve_gb": 1.5,
+  "per_job_gb": 3.0,
+  "max_queue": 64,
+  "rate_limit_per_hour": 0,
+  "rate_limit_per_ip_per_hour": 0,
+  "trust_forwarded_for": false,
+  "max_chars_per_chunk": 250,
+  "xtts_fp16": false,
+  "datasets_constraint": "datasets>=3.0",
+  "moss_model": "OpenMOSS-Team/MOSS-TTS-Nano",
+  "moss_audio_tokenizer": "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano",
+  "moss_device": "cpu",
+  "moss_max_new_frames": 375,
+  "moss_stream": true,
+  "moss_runtime": "onnx",
+  "moss_onnx_threads": 0,
+  "moss_install": {
+    "package": "https://github.com/OpenMOSS/MOSS-TTS-Nano/archive/8b7bcc9341b3b4ef3a3a58ba1338a7d85ff133eb.tar.gz",
+    "deps": ["sentencepiece"]
+  },
+  "asr_for_missing_ref_text": true,
+  "inline_ref_max_seconds": 15.0,
+  "inline_ref_cache_size": 16,
+  "pocket_repo": "jkatzwinkel/pocket-tts-mirror",
+  "pocket_revision": "f78b470a26e776ee2fec6669852396a8a57bf021",
+  "pocket_layers": 24,
+  "pocket_languages": {
+    "24": { "de": "german_24l", "fr": "french_24l", "it": "italian_24l", "es": "spanish_24l", "pt": "portuguese_24l" },
+    "6": { "de": "german", "it": "italian", "es": "spanish", "pt": "portuguese", "en": "english" }
+  },
+  "pocket_decode_steps": 4,
+  "pocket_threads": 0,
+  "pocket_install": {
+    "packages": ["pocket-tts==4.0.1"]
+  },
+  "qwen_models": {
+    "qwen-0.6b": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "qwen-1.7b": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+  },
+  "qwen_non_streaming_mode": true,
+  "qwen_temperature": 0.9,
+  "qwen_chunk_size": 12,
+  "qwen_install": {
+    "packages": ["faster-qwen3-tts==0.5.4"],
+    "transformers": "transformers==5.15.1"
+  },
+  "allowed_sample_ext": [".wav", ".flac", ".mp3"],
+  "hf_endpoint": null,
+  "torch_index_override": null,
+  "log_level": "info"
+}

@@ -1,0 +1,506 @@
+"""Configuration loading (SPEC §10).
+
+Precedence: ``config.json`` < environment variables < CLI arguments.
+ENV vars are upper-cased field names prefixed with ``F5W_`` (e.g. ``F5W_PORT``).
+CLI flags are kebab-cased field names (e.g. ``--max-workers``).
+
+Paths (``samples_dir``, ``models_dir``) are resolved relative to the wrapper
+root (the directory that contains ``config.json``) unless given as absolute.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+from typing import Any, Optional
+
+# Wrapper root = parent of the ``src`` package directory.
+WRAPPER_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG_PATH = WRAPPER_ROOT / "config.json"
+
+ENV_PREFIX = "F5W_"
+
+# Sub-directory of ``models/`` where a user-supplied custom model is dropped (by
+# the host's "install custom data" flow). When present it overrides the
+# configured model for the ACTIVE engine at load time — F5 finetune (a bare
+# checkpoint + optional vocab.txt/arch.txt) for the f5 backend, a full XTTS-v2
+# model directory (config.json + model.pth/…) for the xtts backend. See
+# ``models.resolve_model`` / ``xtts_backend._resolve_model_dir``.
+CUSTOM_MODEL_DIRNAME = "echokraut_custom"
+
+
+@dataclass
+class Config:
+    """Resolved runtime configuration. All SPEC §10 keys plus a few extras."""
+
+    # Bind on all interfaces by default so the host/plugin reaches it without any
+    # config edit. Set an api_key (or narrow host to 127.0.0.1) to lock it down.
+    host: str = "0.0.0.0"
+    port: int = 8765
+    parent_pid: Optional[int] = None
+    api_key: Optional[str] = None
+    python_version: str = "3.11"
+    # Pin torch/torchaudio to a version whose torchaudio.load still uses the
+    # bundled-libsndfile *soundfile* backend (≤2.7.x). Newer torchaudio routes
+    # audio loading through torchcodec, which needs system FFmpeg shared libs —
+    # avoided here so the wrapper stays self-contained (no external binaries).
+    # Bump deliberately and re-verify the soundfile path (SPEC §14.1).
+    torch_version: str = "2.7.0"
+    torchaudio_version: str = "2.7.0"
+    # coqui-tts (XTTS) imports `transformers.pytorch_utils.isin_mps_friendly`,
+    # which transformers REMOVED in 5.x. coqui-tts only declares `transformers>=
+    # 4.57` (no upper bound), so an unconstrained resolve picks 5.x and XTTS
+    # crashes on model-load ("cannot import name 'isin_mps_friendly'"). Pin to
+    # the last 4.x line (4.57.x still has the symbol AND satisfies >=4.57); f5-tts
+    # declares no transformers bound, so it accepts this too. Passed verbatim to
+    # `uv pip install` in step_deps and asserted by `_verify_transformers`.
+    transformers_constraint: str = "transformers>=4.57,<5"
+    # f5-tts pulls in `datasets`, which is otherwise unconstrained. Versions
+    # before 2.16 subclass `pyarrow.PyExtensionType`, which pyarrow REMOVED, so
+    # such a resolution installs cleanly and then dies on the first `import
+    # f5_tts.api` with "module 'pyarrow' has no attribute 'PyExtensionType'" —
+    # from deep inside a traceback that names neither package as the culprit.
+    # The floor keeps the resolver in the era where `pa.ExtensionType` is used
+    # (and where datasets declares a pyarrow floor of its own, so the two can no
+    # longer drift apart). Passed verbatim to `uv pip install` in step_deps.
+    datasets_constraint: str = "datasets>=3.0"
+    # MOSS-TTS-Nano: two HuggingFace repos, because the model and its audio
+    # tokenizer ship separately and BOTH are needed — a checkpoint without its
+    # matching tokenizer produces noise rather than an error.
+    moss_model: str = "OpenMOSS-Team/MOSS-TTS-Nano"
+    moss_audio_tokenizer: str = "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano"
+    # Where MOSS runs, overriding the engine's device choice. **Defaults to the
+    # CPU, and that is the point of this backend rather than a limitation:**
+    # measured on this project's hardware, CPU and an RTX 5090 produce the same
+    # real-time factor (1.25 vs 1.22), so the GPU buys nothing here and staying
+    # off it leaves the card to whatever game is running. Defaulting to "auto"
+    # would quietly take the GPU — the exact thing MOSS was added to avoid.
+    # Set "cuda" to use it anyway (a weak CPU with a strong GPU is the case that
+    # wants it), or "auto" to follow whatever the engine detected.
+    moss_device: str = "cpu"
+    # Ceiling on MOSS's decode loop, in audio frames (the runtime's own unit and
+    # default). It bounds a generation that never stops on its own; the value is
+    # far above any single sentence chunk, so it does not truncate real speech.
+    moss_max_new_frames: int = 375
+    # Whether MOSS hands its audio out in pieces as it is produced. ON, like
+    # XTTS — MOSS really streams, and time to first sound is what makes speech
+    # feel immediate in a game.
+    #
+    # Set false to get the clip in ONE piece instead. That exists because MOSS is
+    # the only engine here that generates SLOWER than real time (measured rtf
+    # 1.25-1.44 against F5's 0.32 and XTTS's 0.44): a consumer that starts
+    # playing on the first piece consumes a second of audio per second while
+    # less than a second arrives, so it runs dry part-way through the line, and
+    # the shortfall grows with the length of the line. Bridging that is the
+    # consumer's job — it is the side that knows about playback — and the
+    # Echokraut plugin does it in StreamBufferPolicy. This flag is for a
+    # consumer that cannot, and pays for it with the full generation time
+    # before the first sound.
+    moss_stream: bool = True
+    # Which MOSS runtime the worker pool loads: "onnx" or "pytorch".
+    #
+    # ONNX is the default because it is the SAME weights, exported, and roughly
+    # 2.5x faster on the CPU (measured, ms per 80 ms frame at 4 threads: 41.4
+    # against 115.4). It is the only speed-up measured here that costs no audio
+    # quality -- int8 quantization, fewer codebooks and bfloat16 all change what
+    # the model produces. It also takes MOSS below real time on an ordinary
+    # machine, which removes the reason a consumer had to buffer at all.
+    #
+    # "pytorch" keeps the original runtime. It stays reachable because the ONNX
+    # graphs are a separate ~763 MB download that an older install does not
+    # have, and because a runtime nobody can fall back to is a runtime nobody
+    # can debug against.
+    moss_runtime: str = "onnx"
+    # Intra-op threads for onnxruntime. 0 = pick a modest default (at most 4).
+    # NOT "more is better": 16 threads measured as slow as ONE and slower than
+    # four, and few threads is also the polite choice next to a running game.
+    moss_onnx_threads: int = 0
+    # onnxruntime is installed on its own, not with the MOSS package: MOSS is
+    # installed --no-deps (it pins torch==2.7.0 and would replace the CUDA
+    # build), so its declared extras never reach the venv.
+    moss_onnx_install: dict = field(
+        default_factory=lambda: {"deps": ["onnxruntime>=1.20"]}
+    )
+    # How MOSS is installed. It publishes no PyPI package, so this is a pinned
+    # source tarball — a COMMIT, not a branch, because a moving `main` would
+    # change what users get without anything in this repo changing. The GitHub
+    # archive URL is used rather than `git+https://`, since pip would then need
+    # git on the machine and a one-click installer cannot assume that.
+    # `--no-deps` keeps its `torch==2.7.0` pin from reaching PyPI and replacing
+    # the CUDA build with a CPU one; the torch re-pin in the bootstrap owns torch.
+    # WeTextProcessing is deliberately absent: it needs `pynini`, which has no
+    # Windows wheels, and it is optional (lazily imported, and there are only
+    # zh/en normalizers anyway).
+    moss_install: dict = field(
+        default_factory=lambda: {
+            "package": (
+                "https://github.com/OpenMOSS/MOSS-TTS-Nano/archive/"
+                "8b7bcc9341b3b4ef3a3a58ba1338a7d85ff133eb.tar.gz"
+            ),
+            "deps": ["sentencepiece"],
+        }
+    )
+    # TTS backend engine the worker pool loads at startup (one per process):
+    #   "f5"         → F5-TTS finetunes (needs a ref-text per sample; CC-BY-NC)
+    #   "xtts"       → Coqui XTTS-v2 (clones from audio only, no ref-text; CPML)
+    #   "moss" → MOSS-TTS-Nano (audio-only clone, 19 languages, real streaming,
+    #             Apache-2.0 code AND weights, and fast enough on the CPU that
+    #             the GPU can stay with the game — see moss_backend.py)
+    # The bootstrap installs ALL engines + all their models, so switching is a
+    # restart with a different --tts-backend (no reinstall). See xtts_backend.py
+    # and moss_backend.py.
+    tts_backend: str = "f5"
+    # Active language at startup; selects which model the worker pool loads.
+    # The per-request ``language`` field must match this (or be omitted).
+    language: str = "de"
+    # Language of the user-facing NDJSON log/progress/error texts (src/i18n.py:
+    # en/de/fr/ja). Empty = follow ``language`` (the plugin passes the game
+    # client language there); anything unsupported falls back to English.
+    ui_language: str = ""
+    # Per-language model definitions. ``en`` is the official multilingual base
+    # (auto-downloaded, no ckpt/vocab needed); de/fr/ja are community finetunes
+    # (CC-BY-NC) resolved from HuggingFace at install time. Verify repo/file
+    # names against F5-TTS SHARED.md when bumping (SPEC §14.3).
+    languages: dict = field(
+        default_factory=lambda: {
+            "en": {"arch": "F5TTS_v1_Base"},
+            "de": {
+                "arch": "F5TTS_Base",
+                "hf_repo": "hvoss-techfak/F5-TTS-German",
+                "ckpt_file": "model_f5tts_german.safetensors",
+                "vocab_file": "vocab.txt",
+            },
+            "fr": {
+                "arch": "F5TTS_Base",
+                "hf_repo": "RASPIAUDIO/F5-French-MixedSpeakers-reduced",
+                "ckpt_file": "model_last_reduced.pt",
+                "vocab_file": "vocab.txt",
+            },
+            "ja": {
+                "arch": "F5TTS_Base",
+                "hf_repo": "Jmica/F5TTS",
+                "ckpt_file": "JA_21999120/model_21999120.pt",
+                "vocab_file": "JA_21999120/vocab_japanese.txt",
+            },
+        }
+    )
+    # Force a hardware backend instead of probing for one. "auto" (default) runs
+    # the usual detection chain; any other value short-circuits it. Needed
+    # wherever the probes cannot see the truth: a slim ROCm container has no
+    # ``rocminfo`` and no ``/opt/rocm``, so detection would fall through to CPU
+    # and the GPU would sit idle. It is also the escape hatch for the inverse
+    # mistake — a CPU-only build that was handed a GPU (``--gpus all``), where
+    # the injected ``nvidia-smi`` makes detection pick a CUDA device that the
+    # installed torch cannot serve. See ``gpu_detect.detect_backend``.
+    gpu_backend: str = "auto"
+    # Native-Windows ROCm install (AMD's own build). Data, not code, so bumping
+    # to a newer ROCm release is an edit here — the URLs are version-specific and AMD
+    # publishes no pip index for Windows, only individual wheels.
+    #
+    # Three things differ from every other backend and all three are AMD's doing:
+    #   * Python 3.12 only (the wheels are cp312; the rest of the wrapper runs 3.11)
+    #   * torch 2.9.1 — and torchaudio 2.9 turned ``load`` into a torchcodec alias
+    #     that needs system FFmpeg, which ``audio_compat`` patches back out
+    #   * wheels by URL, so there is nothing to ``--index-url`` against
+    # ``gpu_pattern`` matches the GPU names AMD lists as supported (Radeon 9000
+    # series and select 7000). Widen it here if AMD adds hardware; a card that
+    # does not match keeps the old DirectML→CPU path instead of installing a
+    # multi-GB stack that cannot run.
+    rocm_windows: dict = field(
+        default_factory=lambda: {
+            "python": "3.12",
+            "torch_version": "2.9.1",
+            "gpu_pattern": r"RX\s*9\d{3}|RX\s*7[89]\d{2}|Radeon\s+Pro\s+W7|Radeon\s+AI\s+PRO",
+            "wheels": [
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl",
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl",
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm-7.2.1.tar.gz",
+            ],
+            "torch_wheels": [
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchaudio-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+                "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl",
+            ],
+        }
+    )
+    samples_dir: str = "samples"
+    models_dir: str = "models"
+    # First-start convenience: with an empty samples folder every /tts is a 404,
+    # and that is the state of every fresh install and every fresh container
+    # volume. The newest voice pack is then fetched from the Echokraut releases.
+    # Identified by TAG PREFIX, not by GitHub's "latest release" — that repo also
+    # publishes plugin releases (see voicepack.py).
+    voicepack_auto_download: bool = True
+    voicepack_repo: str = "RenNagasaki/Echokraut"
+    voicepack_tag_prefix: str = "EK-VoicePack-"
+    # Size of the worker pool. Each worker is a full model copy on the device,
+    # and a single request is always served by exactly ONE of them — more
+    # workers buy concurrency, never speed. Default 1: the common case is a game
+    # client asking for one line at a time, and the VRAM saved is better spent
+    # on a larger model or fp16 headroom. Raise it when several requests really
+    # do arrive at once; free VRAM then caps the actual count below this number.
+    # ``null`` restores the old behaviour: derive the count from free VRAM, at
+    # most 4.
+    max_workers: Optional[int] = 1
+    vram_reserve_gb: float = 1.5
+    per_job_gb: float = 3.0
+    max_queue: int = 64
+    # Request limits for /tts, in a sliding one-hour window. 0 = off (default:
+    # a local wrapper serving one game client has no reason to ration itself).
+    # These are NOT back-pressure — ``max_queue`` already answers 503 when the
+    # engine is saturated. See ratelimit.py.
+    rate_limit_per_hour: int = 0
+    rate_limit_per_ip_per_hour: int = 0
+    # Only read X-Forwarded-For when the wrapper sits behind a proxy you control.
+    # Off by default: otherwise any caller can invent an address per request and
+    # the per-IP limit means nothing.
+    trust_forwarded_for: bool = False
+    max_chars_per_chunk: int = 250
+    # XTTS token-streaming granularity: audio tokens per streamed chunk handed to
+    # `inference_stream` (lower = lower first-audio latency, slightly more
+    # overhead). XTTS default is 20. F5 has no token streaming and ignores this.
+    stream_chunk_size: int = 20
+    # Load the XTTS model in half precision (fp16) for a ~1.3-1.8x inference
+    # speedup on a GPU. Opt-in (default off) and **only applied on a CUDA device**
+    # (covers NVIDIA and ROCm; ignored on CPU/dml/xpu, where fp16 is unsupported
+    # or slower). F5 ignores this. Experimental — verify audio quality per voice.
+    xtts_fp16: bool = False
+    asr_for_missing_ref_text: bool = True
+    # Inline references (/tts with ``ref_audio``, plan game-voice-reference
+    # §2.4): held in RAM only, never written. The length bound is the plan's
+    # hard range for a usable clip (3-15 s) with the lower end left to the
+    # caller; it is also what keeps F5 sane — its text budget per batch is
+    # ``(22 - ref_seconds)``, which goes negative for a long reference.
+    inline_ref_max_seconds: float = 15.0
+    # Conditioning entries (XTTS latents, F5 reference tensor, MOSS prompt
+    # codes) kept PER WORKER for inline references, least recently used out.
+    # 0 = no cache. A conversation reuses one voice, so a handful is plenty.
+    inline_ref_cache_size: int = 16
+    # Response cache (src/response_cache.py): an identical /tts request (text,
+    # language, voice, ref text, speed, nfe_step) within this many minutes gets
+    # the SAME PCM instead of a new generation — also while the first run is
+    # still going (a second client joins it). 0 = off (no sharing either).
+    # Process-level options (engine, pocket_*, qwen_*, …) are not part of the
+    # key: they are fixed per process and the cache lives in its memory.
+    # A request with "no_cache": true always generates anew (and replaces the
+    # entry); the plugin sends it when the user explicitly (re)generates a clip.
+    response_cache_minutes: float = 5.0
+    # Upper bound for finished entries in memory, least recently used out.
+    # 24 kHz s16 mono is ~2.8 MB per minute of audio.
+    response_cache_max_mb: float = 128.0
+    # --- Qwen3-TTS (faster-qwen3-tts, CUDA graphs; plan qwen3-und-lazy-install.md)
+    # Engine id -> HuggingFace repo. Two engines, one backend: the ids are what
+    # the plugin stores (`--tts-backend qwen-0.6b` / `qwen-1.7b`).
+    qwen_models: dict = field(
+        default_factory=lambda: {
+            "qwen-0.6b": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            "qwen-1.7b": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        }
+    )
+    # Whole text as input up front (user default 2026-11-12). Affects only the
+    # TEXT side: the audio still streams (measured: first audio 0.28 s, 13 parts
+    # per long sentence).
+    qwen_non_streaming_mode: bool = True
+    # Library default 0.9; the user's offered alternative is 0.7 (calmer).
+    qwen_temperature: float = 0.9
+    # Codec frames per streamed part (12 = the measured setup).
+    qwen_chunk_size: int = 12
+    # --- Pocket TTS (Kyutai, CPU; src/pocket_backend.py)
+    # Voice-cloning weights from a CC-BY-4.0 mirror pinned to ONE commit (the
+    # official kyutai/pocket-tts is gated). Our own mirror since 2026-11-13: a
+    # byte-identical copy of lunahr/pocket-tts-ungated@d03cd73 (tools/pocket-mirror.py).
+    pocket_repo: str = "jkatzwinkel/pocket-tts-mirror"
+    pocket_revision: str = "f78b470a26e776ee2fec6669852396a8a57bf021"
+    # 24 (default, sounds better) or 6 (about 2.4x faster, audibly a bit worse;
+    # user, 2026-11-13). One option, not a second engine.
+    pocket_layers: int = 24
+    # Layers -> wrapper language code -> folder in the mirror. What the mirror
+    # has: 24 layers without English, 6 layers without French; a missing
+    # combination falls back to the other size (pocket_backend.language_folder).
+    # No Japanese at all.
+    pocket_languages: dict = field(
+        default_factory=lambda: {
+            "24": {
+                "de": "german_24l",
+                "fr": "french_24l",
+                "it": "italian_24l",
+                "es": "spanish_24l",
+                "pt": "portuguese_24l",
+            },
+            "6": {
+                "de": "german",
+                "it": "italian",
+                "es": "spanish",
+                "pt": "portuguese",
+                "en": "english",
+            },
+        }
+    )
+    # 1 / 4 / 8: 1 is fastest but occasionally adds reverb; 4 and 8 do not.
+    # Measured 2026-11-13 (4 threads, 7 German refs): 24 layers rtf 0.60/0.69/0.81,
+    # 6 layers 0.21/0.29/0.41; with 1 step WER doubles (6: 4.6 %, 24: 9.4 %),
+    # so 6 layers never runs with 1 (raised to 4, see pocket_backend.decode_steps).
+    pocket_decode_steps: int = 4
+    # torch CPU threads for Pocket; 0 = automatic (at most 4). Measured on a
+    # 16-core Ryzen (rtf, torch 2.7): 1 thread ≈ 0.95, 4 → 0.78, 8 → 0.75,
+    # 16 → 0.88 — and a launched server may start with ONE thread (seen live),
+    # so the value is always set explicitly. Few threads also leave the CPU
+    # to the game, which is the point of a CPU engine.
+    pocket_threads: int = 0
+    pocket_install: dict = field(default_factory=lambda: {"packages": ["pocket-tts==4.0.1"]})
+    # Pins as data. faster-qwen3-tts >= 0.4 needs transformers 5 (hence its own
+    # venv group, `.venv-qwen`); 0.5.4 sounded better than the transformers-4
+    # line 0.3.2 in the user's A/B (2026-11-12). 5.22 breaks the tokenizer
+    # encoder (`Qwen3TTSTokenizerV2Encoder.upsample`), so the pin is exact.
+    qwen_install: dict = field(
+        default_factory=lambda: {
+            "packages": ["faster-qwen3-tts==0.5.4"],
+            "transformers": "transformers==5.15.1",
+        }
+    )
+    allowed_sample_ext: list[str] = field(
+        default_factory=lambda: [".wav", ".flac", ".mp3"]
+    )
+    hf_endpoint: Optional[str] = None
+    torch_index_override: Optional[str] = None
+    log_level: str = "info"
+
+    # ---- resolved absolute paths (computed, not part of the JSON schema) ----
+    @property
+    def root(self) -> Path:
+        return WRAPPER_ROOT
+
+    @property
+    def samples_path(self) -> Path:
+        return self._resolve(self.samples_dir)
+
+    @property
+    def models_path(self) -> Path:
+        return self._resolve(self.models_dir)
+
+    @property
+    def custom_model_path(self) -> Path:
+        """Directory a user-installed custom model lives in (may not exist)."""
+        return self.models_path / CUSTOM_MODEL_DIRNAME
+
+    def _resolve(self, value: str) -> Path:
+        p = Path(value)
+        return p if p.is_absolute() else (WRAPPER_ROOT / p)
+
+    @property
+    def normalized_exts(self) -> set[str]:
+        """Lower-cased extensions with a leading dot, for matching."""
+        out: set[str] = set()
+        for e in self.allowed_sample_ext:
+            e = e.lower()
+            out.add(e if e.startswith(".") else f".{e}")
+        return out
+
+
+_BOOL_TRUE = {"1", "true", "yes", "on"}
+_BOOL_FALSE = {"0", "false", "no", "off"}
+
+
+def _coerce(name: str, raw: Any, current: Any) -> Any:
+    """Coerce a string (from ENV/CLI) to the type of the existing field value."""
+    if raw is None or not isinstance(raw, str):
+        return raw
+    # Choose the target type from the dataclass default when current is None.
+    if name in ("parent_pid", "max_workers"):
+        return None if raw == "" or raw.lower() == "null" else int(raw)
+    if name in (
+        "port",
+        "max_queue",
+        "max_chars_per_chunk",
+        "stream_chunk_size",
+        "rate_limit_per_hour",
+        "rate_limit_per_ip_per_hour",
+        "moss_max_new_frames",
+        "moss_onnx_threads",
+        "inline_ref_cache_size",
+        "qwen_chunk_size",
+        "pocket_layers",
+        "pocket_decode_steps",
+        "pocket_threads",
+    ):
+        return int(raw)
+    if name in (
+        "vram_reserve_gb", "per_job_gb", "inline_ref_max_seconds", "qwen_temperature",
+        "response_cache_minutes", "response_cache_max_mb",
+    ):
+        return float(raw)
+    if name in (
+        "asr_for_missing_ref_text",
+        "xtts_fp16",
+        "voicepack_auto_download",
+        "moss_stream",
+        "trust_forwarded_for",
+        "qwen_non_streaming_mode",
+    ):
+        low = raw.lower()
+        if low in _BOOL_TRUE:
+            return True
+        if low in _BOOL_FALSE:
+            return False
+        raise ValueError(f"invalid bool for {name}: {raw!r}")
+    if name == "allowed_sample_ext":
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    if name in ("languages", "rocm_windows", "moss_install", "moss_onnx_install", "qwen_models", "qwen_install", "pocket_languages", "pocket_install"):
+        return json.loads(raw)
+    if name in ("api_key", "hf_endpoint", "torch_index_override"):
+        return None if raw == "" or raw.lower() == "null" else raw
+    return raw
+
+
+def _field_names() -> list[str]:
+    return [f.name for f in fields(Config)]
+
+
+def load_config(
+    argv: Optional[list[str]] = None,
+    config_path: Optional[Path] = None,
+    env: Optional[dict[str, str]] = None,
+) -> Config:
+    """Build a :class:`Config` applying JSON < ENV < CLI precedence."""
+    env = dict(os.environ if env is None else env)
+    names = _field_names()
+
+    # 1) JSON base
+    path = config_path or DEFAULT_CONFIG_PATH
+    data: dict[str, Any] = {}
+    if path.exists():
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data = {k: v for k, v in data.items() if k in names}
+
+    cfg = Config(**data)
+
+    # 2) ENV overrides
+    for name in names:
+        env_key = ENV_PREFIX + name.upper()
+        if env_key in env:
+            setattr(cfg, name, _coerce(name, env[env_key], getattr(cfg, name)))
+
+    # 3) CLI overrides
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--start", action="store_true", help="Start the server.")
+    parser.add_argument("--config", dest="config", default=None)
+    for name in names:
+        parser.add_argument(f"--{name.replace('_', '-')}", dest=name, default=None)
+    ns, _unknown = parser.parse_known_args(argv)
+
+    for name in names:
+        val = getattr(ns, name)
+        if val is not None:
+            setattr(cfg, name, _coerce(name, val, getattr(cfg, name)))
+
+    # Every process (bootstrap, server, the `python -m` download entries, the
+    # Docker entrypoint's calls) starts by loading its config, so this is the
+    # one place that picks the language of the user-facing NDJSON texts.
+    from . import i18n
+
+    i18n.use_config(cfg)
+    return cfg

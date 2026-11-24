@@ -1,0 +1,276 @@
+"""MOSS-TTS-Nano backend — the wrapper's third TTS engine.
+
+Selected at startup via ``config.tts_backend == "moss"``. OpenMOSS's 0.1B model
+is the first engine here that combines everything the others only have in parts,
+and every claim below was measured on this machine before the code was written:
+
+* **It does not need the GPU.** CPU and an RTX 5090 measured the same real-time
+  factor (1.19-1.24 vs 1.16-1.40). For a plugin that speaks while a game renders,
+  that is the whole point: set ``moss_device: "cpu"`` and the graphics card stays
+  with the game.
+* **Real streaming, and it is fast to first sound.** ``synthesize_stream``
+  yields 41-54 audio chunks per sentence; first audio arrived after 0.12 s on
+  GPU and 0.45 s on CPU, against ~2.4 s for XTTS and 6.2 s for the Qwen backend
+  that was tried and dropped. Time-to-first-sound is what makes speech feel
+  immediate, far more than the total.
+* **Apache-2.0 for code and weights**, so synthesized audio carries no
+  non-commercial restriction — unlike F5 (CC-BY-NC) and XTTS (CPML).
+* **All four FFXIV client languages** (en/ja/de/fr) among 19, in one model.
+* **312 MB** of weights against F5's ~5 GB and XTTS's ~2 GB.
+
+The honest limit: **rtf ~1.2 is slower than real time.** Streaming hides it for
+short lines (playback starts long before generation ends), but a long sentence
+will be caught up with. It is the price for a model this small.
+
+Cloning needs **no transcript** — reference audio alone, like XTTS.
+
+All torch / moss imports are lazy (inside the worker) so this module — and the
+unit suite — import without those heavy deps installed.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Iterator
+
+import numpy as np
+
+from . import hfcache, i18n, ndjson, progress, selftest
+from .moss_audio import ContractResampler
+from .moss_common import DEFAULT_SAMPLE_RATE, MossWorkerBase
+from .config import Config, load_config
+
+
+# ISO codes for the 19 languages the model card lists. MOSS takes NO language
+# argument — it infers the language from the text itself — so this set exists
+# purely so the server can reject a request for something the model was never
+# trained on, instead of returning confident nonsense.
+MOSS_LANGUAGES = frozenset(
+    {
+        "zh", "en", "de", "es", "fr", "ja", "it", "hu", "ko", "ru",
+        "fa", "ar", "pl", "pt", "cs", "da", "sv", "el", "tr",
+    }
+)
+
+
+def _model_dirs(config: Config) -> tuple[Path, Path]:
+    """(checkpoint dir, audio tokenizer dir) for the two repos MOSS needs.
+
+    Flat directories under ``models/``, not the HuggingFace cache: that cache
+    links ``snapshots/`` to ``blobs/`` with symlinks, and creating one on Windows
+    needs a privilege a normal account does not have — a download into it died
+    with ``WinError 1314`` when this was first tried for another engine.
+    """
+    # UNDERSCORES, not hyphens, and that is load-bearing. MOSS ships its model
+    # code with the weights (`trust_remote_code`), and transformers turns the
+    # directory name into a Python module name — a hyphen becomes the literal
+    # text "_hyphen_", and the module the generated code then imports by its own
+    # name cannot be resolved: "No module named
+    # transformers_modules.moss_hyphen_tts_hyphen_nano". Hit live on the first
+    # real load.
+    base = config.models_path
+    return base / "moss_tts_nano", base / "moss_audio_tokenizer_nano"
+
+
+def _resolve_model_dirs(config: Config) -> tuple[str, str]:
+    """Local paths the worker loads from; a custom model wins over the download.
+
+    A user-supplied model goes in ``models/echokraut_custom/`` and must bring its
+    own audio tokenizer alongside the checkpoint, since MOSS needs both halves —
+    a checkpoint without a matching tokenizer produces noise rather than an error.
+    """
+    custom = config.custom_model_path
+    if (custom / "config.json").is_file() and (custom / "audio_tokenizer").is_dir():
+        ndjson.log_once(i18n.t("model.custom", engine="MOSS", name=custom))
+        return str(custom), str(custom / "audio_tokenizer")
+    checkpoint, tokenizer = _model_dirs(config)
+    # Say plainly that the weights are missing. Without this, transformers gets
+    # a path that is not a directory, decides it must be a HuggingFace repo id
+    # instead, and fails validation — "Repo id must use alphanumeric chars […]
+    # 'C:\…\models\moss_tts_nano'", which names neither the real problem nor
+    # the fix. Seen live after an upgrade that installed the engine but skipped
+    # its download.
+    for path in (checkpoint, tokenizer):
+        if not (path / "config.json").is_file():
+            raise RuntimeError(
+                f"MOSS-Modelldateien fehlen in {path}. "
+                "Hole sie mit `python -m src.moss_backend` nach (oder lösche "
+                ".state/model-moss.done und starte neu)."
+            )
+    return str(checkpoint), str(tokenizer)
+
+
+def _resolve_device(config: Config, device: str) -> str:
+    """Which device MOSS should load on.
+
+    ``config.moss_device`` overrides the engine's choice, and "cpu" is a
+    legitimate answer rather than a fallback: measured, CPU matches the GPU here,
+    so running on the CPU costs nothing and leaves the graphics card to whatever
+    else the user is doing. dml/xpu have no path and map to CPU like the other
+    backends.
+    """
+    forced = (config.moss_device or "auto").strip().lower()
+    if forced in ("cpu", "cuda"):
+        return forced
+    return "cpu" if device in ("dml", "xpu") else device
+
+
+class MossWorker(MossWorkerBase):
+    """Wraps one MOSS-TTS-Nano service bound to a device."""
+
+    # On, like XTTS. `config.moss_stream` can turn it off per instance for a
+    # consumer that cannot bridge this engine's shortfall (it generates slower
+    # than real time — see the flag's own comment). `infer()` drains
+    # `infer_stream()` either way, so the flag changes who waits, not how the
+    # audio is produced.
+    supports_streaming = True
+
+    def __init__(self, config: Config, device: str):
+        # BEFORE the import, not after: transformers resolves its cache paths at
+        # import time, so setting them afterwards is too late and the model code
+        # lands in whatever machine-wide cache the user happens to have (found
+        # live: a global HF_HOME sent it to G:\cache instead of models/).
+        hfcache.use_models_dir(config)
+
+        from moss_tts_nano_runtime import NanoTTSService  # lazy: heavy import
+
+        self.sample_rate = DEFAULT_SAMPLE_RATE
+        self._max_new_frames = int(config.moss_max_new_frames)
+        self.supports_streaming = bool(config.moss_stream)
+        # Owns the per-chunk conversion AND its cross-chunk state.
+        self._resampler = ContractResampler()
+
+        checkpoint, tokenizer = _resolve_model_dirs(config)
+        resolved = _resolve_device(config, device)
+        # The RESOLVED device, not the requested one. This worker is the only
+        # one that overrides the engine's choice, and `/health` and the `ready`
+        # event read this attribute — reporting "cuda" while the model sits on
+        # the CPU is a lie told at exactly the place a user looks to check.
+        self.device = resolved
+        # Generated clips are written to disk by the runtime on every request —
+        # there is no flag to turn that off. Keeping them under models/ would
+        # grow without bound on a server that speaks thousands of game lines, so
+        # they go to a directory this worker owns and empties (see _cleanup).
+        self._scratch = config.models_path / "moss-scratch"
+        self._scratch.mkdir(parents=True, exist_ok=True)
+        self._service = NanoTTSService(
+            checkpoint_path=checkpoint,
+            audio_tokenizer_path=tokenizer,
+            device=resolved,
+            output_dir=str(self._scratch),
+        )
+        self._service.preload(load_model=True)
+        ndjson.log_once(i18n.t("engine.loaded_on", name="MOSS-TTS-Nano", device=resolved))
+
+    # ------------------------------------------------------------------ audio
+
+    # Samples of the previous chunk fed back into the next resample so the filter
+    # does not start cold. 64 at 48 kHz is ~1.3 ms — far more than the filter
+    # needs, far less than anyone could notice as latency.
+    # Kept as a class attribute because the conversion itself now lives in
+    # moss_audio.ContractResampler — two runtimes need it, and a second copy
+    # would have drifted from this one at the first edit.
+    RESAMPLE_OVERLAP = ContractResampler.OVERLAP
+
+    def _to_contract(self, waveform, source_rate: int) -> np.ndarray:
+        """MOSS's 48 kHz stereo chunk -> the wrapper's 24 kHz mono float32."""
+        return self._resampler.to_contract(waveform, source_rate, self.sample_rate)
+
+    def _cleanup(self, path) -> None:
+        """Drop the file the runtime insisted on writing. Never fatal.
+
+        A failure here means one leftover file, which is worth a log line and
+        nothing more — certainly not a failed request that produced good audio.
+        """
+        try:
+            if path:
+                Path(str(path)).unlink(missing_ok=True)
+        except OSError as exc:  # noqa: BLE001 — leftover file, not a failure
+            ndjson.log_once(i18n.t("moss.scratch_not_removed", error=exc), level="warning")
+
+    def _events(self, ref_file: str, gen_text: str):
+        """The runtime's streaming generator, with our arguments applied."""
+        return self._service.synthesize_stream(
+            text=gen_text,
+            mode="voice_clone",
+            prompt_audio_path=ref_file,
+            max_new_frames=self._max_new_frames,
+        )
+
+    # ---------------------------------------------------------------- protocol
+
+    def infer_stream(
+        self,
+        ref_file: str,
+        ref_text: str,
+        gen_text: str,
+        speed: float,
+        language: str | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Yield float32 chunks as MOSS produces them.
+
+        ``ref_text`` is unused (MOSS clones from the audio alone) and so is
+        ``language``: the model infers the language from the text it is given,
+        which is why there is no language argument to pass on. ``speed`` has no
+        equivalent either and is reported once rather than silently dropped.
+        """
+        self.warn_unsupported_speed(speed)
+        final_path = None
+        # Each request starts a new signal: carrying the previous one's tail
+        # across would splice the end of the last sentence into this one.
+        self._resampler.reset()
+        try:
+            for event in self._events(ref_file, gen_text):
+                if event.get("type") == "audio":
+                    chunk = self._to_contract(event["waveform"], int(event.get("sample_rate", 0)))
+                    if chunk.size:
+                        yield chunk
+                elif event.get("type") == "result":
+                    final_path = event.get("audio_path")
+        finally:
+            self._cleanup(final_path)
+
+
+
+
+def download_model(config: Config) -> None:
+    """Pre-download both MOSS repos at install time. Idempotent.
+
+    Two repos, because the model and its audio tokenizer ship separately and
+    both are required. ``local_dir`` keeps them out of the symlinked HF cache
+    (see :func:`_model_dirs`). Per-file progress is routed to NDJSON by the tqdm
+    hook in :mod:`src.progress`.
+    """
+    config.models_path.mkdir(parents=True, exist_ok=True)
+    hfcache.use_models_dir(config)
+    checkpoint_dir, tokenizer_dir = _model_dirs(config)
+    mp = progress.ModelProgress()
+    mp.stage("MOSS-TTS-Nano: ")
+    ndjson.log(i18n.t("model.loading", name="MOSS-TTS-Nano"))
+    with mp.patch():
+        from huggingface_hub import snapshot_download  # lazy: imported inside the patch
+
+        for repo, target in (
+            (config.moss_model, checkpoint_dir),
+            (config.moss_audio_tokenizer, tokenizer_dir),
+        ):
+            snapshot_download(
+                repo_id=repo,
+                local_dir=str(target),
+                endpoint=config.hf_endpoint or None,
+            )
+    ndjson.log(i18n.t("model.ready", name="MOSS-TTS-Nano"))
+
+
+if __name__ == "__main__":
+    # Entry point used by the bootstrap (run inside the venv) when the active
+    # backend is MOSS: downloads the weights into models/.
+    import sys
+    import traceback
+
+    try:
+        download_model(load_config())
+    except Exception as exc:  # noqa: BLE001 — surface as a fatal NDJSON error
+        traceback.print_exc(file=sys.stderr)
+        ndjson.error(i18n.t("model.download_failed", name="MOSS-TTS-Nano", error=exc), fatal=True)
+        raise SystemExit(1)
