@@ -1,0 +1,152 @@
+"""Structured NDJSON event sink for stdout (SPEC §8.1).
+
+Every line written here is exactly one JSON object terminated by ``\\n`` and
+immediately flushed, so the C# host can read events line-by-line as they happen.
+This module is the *single* place allowed to write to stdout — everything else
+(logs, tracebacks) goes to stderr — so the stream stays machine-parseable.
+
+The host expects ``PYTHONUNBUFFERED=1`` and ``PYTHONUTF8=1`` in the environment
+(SPEC §8.1); we still flush explicitly and force UTF-8 here so a missing env var
+cannot corrupt the protocol.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import threading
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+# A single lock so concurrent threads (worker pool, watchdog, request handlers)
+# never interleave half-written JSON lines on stdout.
+_lock = threading.Lock()
+
+# Messages already emitted via ``log_once`` (guarded by ``_lock``).
+_seen_once: set[tuple[str, str]] = set()
+
+
+def _write(obj: dict[str, Any]) -> None:
+    # Stamp every event with a UTC ISO-8601 timestamp (millisecond precision) so
+    # the host can measure when things happen — e.g. per-request timing. Additive
+    # and never overrides an explicit ``ts`` a caller already set.
+    obj.setdefault("ts", datetime.now(timezone.utc).isoformat(timespec="milliseconds"))
+    # A localized text (src/i18n.py) also travels as its stable catalog key, so
+    # a consumer never has to match a message that changes with the language.
+    key = getattr(obj.get("message"), "key", None)
+    if key:
+        obj.setdefault("key", key)
+    line = json.dumps(obj, ensure_ascii=False)
+    with _lock:
+        # Reconfigure lazily in case the parent did not set PYTHONUTF8.
+        stream = sys.stdout
+        try:
+            stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+        try:
+            stream.write(line + "\n")
+            stream.flush()
+        except (BrokenPipeError, OSError):
+            # The host/bootstrap that reads our stdout has gone away (e.g. window
+            # closed). Nothing to do — we're shutting down anyway; don't crash.
+            pass
+
+
+def starting() -> None:
+    """First event emitted by the bootstrap before any work begins."""
+    _write({"event": "starting"})
+
+
+def progress(
+    index: int,
+    total: int,
+    step: str,
+    message: Optional[str] = None,
+    percent: Optional[int] = None,
+    done: bool = False,
+    skipped: bool = False,
+) -> None:
+    """Install/synthesis progress event (SPEC §3.1).
+
+    ``index`` is 1-based, ``total`` is the fixed step count, ``step`` is a stable
+    key (e.g. ``"deps"``), ``message`` is human-readable. ``percent`` (0-100)
+    animates a download bar; ``done``/``skipped`` mark step completion.
+    """
+    obj: dict[str, Any] = {
+        "event": "progress",
+        "index": index,
+        "total": total,
+        "step": step,
+    }
+    if message is not None:
+        obj["message"] = message
+    if percent is not None:
+        obj["percent"] = int(percent)
+    if done:
+        obj["done"] = True
+    if skipped:
+        obj["skipped"] = True
+    _write(obj)
+
+
+def ready(host: str, port: int, backend: str, device: str, workers: int) -> None:
+    """Server is listening on host:port (SPEC §8.1)."""
+    _write(
+        {
+            "event": "ready",
+            "host": host,
+            "port": port,
+            "backend": backend,
+            "device": device,
+            "workers": workers,
+        }
+    )
+
+
+def log(message: str, level: str = "info") -> None:
+    """Informational log line surfaced to the host UI."""
+    _write({"event": "log", "level": level, "message": message})
+
+
+def log_once(message: str, level: str = "info") -> None:
+    """Like :func:`log`, but emits each distinct message only once per process.
+
+    For lines that state a *fact about this process* ("using the custom model",
+    "fp16 enabled") rather than an event. Those live in code that runs once per
+    worker (the pool builds ``max_workers_hint`` workers, each loading the model),
+    so a plain ``log`` would repeat the same line n times and read like a bug.
+    """
+    with _lock:
+        if (level, message) in _seen_once:
+            return
+        _seen_once.add((level, message))
+    log(message, level=level)
+
+
+def warn_ignored_speed(engine_name: str, speed: float) -> None:
+    """Say once that ``speed`` does nothing for an engine without that parameter.
+
+    Silently ignoring a value the caller set would look like a wrapper bug from
+    the outside, and logging it per request would drown the log.
+    """
+    if speed != 1.0:
+        from . import i18n
+
+        log_once(i18n.t("engine.speed_ignored", name=engine_name), level="warning")
+
+
+def reset_log_once() -> None:
+    """Forget what :func:`log_once` has already emitted (tests only)."""
+    with _lock:
+        _seen_once.clear()
+
+
+def error(message: str, fatal: bool = False) -> None:
+    """Error event. ``fatal=True`` means the process will exit non-zero."""
+    _write({"event": "error", "message": message, "fatal": fatal})
+
+
+def shutdown() -> None:
+    """Emitted right before a graceful exit."""
+    _write({"event": "shutdown"})

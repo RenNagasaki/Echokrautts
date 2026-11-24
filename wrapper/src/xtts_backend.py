@@ -1,0 +1,450 @@
+"""XTTS-v2 backend — the wrapper's second TTS engine (SPEC addendum).
+
+An alternative to the F5-TTS worker, selected at startup via
+``config.tts_backend == "xtts"``. XTTS-v2 (Coqui) is natively multilingual
+(en/de/fr/ja among 17 languages) and clones a voice from a reference sample
+**without needing its transcript** — so the ASR ref-text path is a no-op here.
+
+Design parity with the F5 worker: this exposes the same :class:`WorkerProtocol`
+(``infer`` returns one float32 mono clip @ 24000 Hz per sentence chunk), so the
+:class:`~src.engine.Engine` worker pool, backpressure and streaming logic are
+reused unchanged. Conditioning latents are computed once per reference sample
+and cached, since the engine calls ``infer`` repeatedly with the same sample.
+
+License note: XTTS-v2 weights are under the Coqui Public Model License (CPML,
+non-commercial). We use the maintained community fork ``coqui-tts`` (idiap) —
+the original ``TTS`` package is unmaintained. Accepting the license
+non-interactively is done via ``COQUI_TOS_AGREED=1``.
+
+All torch / TTS imports are lazy (inside the worker / resolver) so this module —
+and the unit test suite — import without those heavy deps installed.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import threading
+from pathlib import Path
+
+import numpy as np
+
+from . import hfcache, i18n, ndjson, progress, selftest
+from .config import Config, load_config
+from .inline_ref import ConditioningCache, InlineReference
+
+# Coqui model id for XTTS-v2 (multilingual, multi-dataset).
+XTTS_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
+DEFAULT_SAMPLE_RATE = 24000  # XTTS-v2 output rate
+
+# Rate coqui's ``get_conditioning_latents`` loads references at (``load_sr``)
+# and the reference lengths it uses by default. The inline path repeats that
+# call from a tensor, so it must use the same numbers or an inline voice would
+# condition differently from the same audio as a file.
+XTTS_LOAD_SR = 22050
+XTTS_GPT_COND_LEN = 6
+XTTS_GPT_COND_CHUNK_LEN = 6
+
+# ISO codes XTTS-v2 accepts at inference. Unlike F5 (one finetune per language,
+# fixed at startup), XTTS is natively multilingual — so the per-request
+# ``language`` selects the target language with NO model reload. Superset of the
+# wrapper's en/de/fr/ja language map; the server validates requests against this.
+XTTS_LANGUAGES = frozenset(
+    {
+        "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl",
+        "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi",
+    }
+)
+
+
+class WorkerBusyError(RuntimeError):
+    """A second call reached an XTTS model that is still computing.
+
+    Coqui keeps per-request state on the model (the text prefix of
+    ``store_prefix_emb``), so two calls at once corrupt each other — on CUDA as a
+    ``device-side assert`` (``Indexing.cu: srcIndex < srcSelectDimSize``) that
+    kills the whole process. Failing here keeps it an ordinary request error.
+    The engine never lets this happen (``engine._run_to_completion``); this is
+    the guard should that ever break again."""
+
+
+def _should_use_fp16(config: Config, device: str) -> bool:
+    """Whether to load the XTTS model in half precision.
+
+    Only on CUDA (NVIDIA or ROCm, both reported as ``"cuda"``) and only when
+    ``config.xtts_fp16`` is set. fp16 on CPU is unsupported/slower, and dml/xpu
+    are mapped to CPU by the worker — so pass the *resolved* device here.
+    """
+    return bool(config.xtts_fp16) and device == "cuda"
+
+
+# Submodules that are fed tensors derived **directly from the reference audio**
+# (raw waveform / mel), which the TTS library always produces as float32 and
+# never casts. Under a blanket ``model.half()`` they would see float32 input
+# against half weights → ``RuntimeError: Input type (torch.cuda.FloatTensor) and
+# weight type (torch.cuda.HalfTensor) should be the same`` inside
+# ``get_conditioning_latents`` (speaker encoder first, then the GPT style
+# encoder). They are tiny and run once per reference sample (result cached), so
+# keeping them in float32 costs nothing measurable; the latents they produce are
+# cast to half in :meth:`XTTSWorker._conditioning` before they enter the model.
+FP16_FLOAT32_MODULES = (
+    "hifigan_decoder.speaker_encoder",  # get_speaker_embedding(audio_16k)
+    "gpt.conditioning_encoder",  # gpt.get_style_emb(mel)
+    "gpt.conditioning_perceiver",  # only when use_perceiver_resampler
+)
+
+
+def _module_by_path(model, path: str):
+    """``getattr`` chain, ``None`` if any step is missing (library drift)."""
+    obj = model
+    for part in path.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
+class _HalfOutput:
+    """Wraps a plain-callable "embedding" so its output follows the model dtype.
+
+    Needed for the GPT2 position embeddings: coqui replaces ``gpt.wpe`` with
+    ``functools.partial(null_position_embeddings, …)``, which returns
+    ``torch.zeros(...)`` with **no dtype** — always float32, and being a plain
+    callable rather than an ``nn.Module`` it is invisible to ``model.half()``.
+    Adding it to the half embeddings promotes the whole hidden state back to
+    float32, so every LayerNorm in the stack then fails with
+    ``expected scalar type Float but found Half``.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __call__(self, *args, **kwargs):
+        out = self.inner(*args, **kwargs)
+        return out.half() if hasattr(out, "half") else out
+
+
+# Attributes that look like embeddings but are plain callables (see _HalfOutput).
+FP16_CALLABLE_EMBEDDINGS = (("gpt.gpt", "wpe"),)
+
+
+def _patch_callable_embeddings(model) -> list[str]:
+    """Make non-Module embedding callables emit half. Returns patched paths.
+
+    Skips anything that *is* an ``nn.Module`` (detected via ``parameters``, so
+    this stays importable without torch) — those are already covered by
+    ``model.half()`` and must not be replaced, or they'd be unregistered.
+    """
+    patched: list[str] = []
+    for path, attr in FP16_CALLABLE_EMBEDDINGS:
+        owner = _module_by_path(model, path)
+        inner = getattr(owner, attr, None)
+        if owner is None or inner is None or hasattr(inner, "parameters"):
+            continue
+        setattr(owner, attr, _HalfOutput(inner))
+        patched.append(f"{path}.{attr}")
+    return patched
+
+
+def _apply_fp16(model) -> list[str]:
+    """Half-precision the model, keeping the reference-audio front-end float32.
+
+    Returns the module paths that were kept in float32 (for logging/tests).
+    Missing paths are skipped so a coqui-tts version that renames a submodule
+    degrades to "may crash again" rather than "crashes at load".
+    """
+    model.half()
+    _patch_callable_embeddings(model)
+    kept: list[str] = []
+    for path in FP16_FLOAT32_MODULES:
+        module = _module_by_path(model, path)
+        if module is not None and hasattr(module, "float"):
+            module.float()
+            kept.append(path)
+    return kept
+
+
+def _resolve_custom_model_dir(config: Config) -> str | None:
+    """A user-supplied XTTS model dropped into ``models/echokraut_custom/``.
+
+    Returns the directory when it looks like a full XTTS-v2 model (a
+    ``config.json`` plus a ``model.pth``/``model.safetensors`` weight file),
+    else ``None``. F5 finetunes ship a bare checkpoint with no ``config.json``,
+    so the two backends can share the same custom-model folder safely.
+    """
+    d = config.custom_model_path
+    if (d / "config.json").is_file() and (
+        (d / "model.pth").is_file() or (d / "model.safetensors").is_file()
+    ):
+        # log_once: the resolver runs once per worker (pool of n) — a plain log
+        # would print the same line n times.
+        ndjson.log_once(i18n.t("model.custom", engine="XTTS", name=d))
+        return str(d)
+    return None
+
+
+def _resolve_model_dir(config: Config) -> str:
+    """Download (or reuse the cache for) the XTTS-v2 model directory.
+
+    A user-supplied custom model (``models/echokraut_custom/``) wins over the
+    base download. Otherwise, idempotent: Coqui's :class:`ModelManager` skips the
+    download when the files already exist under ``models/``. Returns the local
+    model directory path. Used by BOTH the bootstrap (install-time preload) and
+    the worker (load) — single source of truth, mirroring ``models.resolve_model``
+    for F5.
+    """
+    custom = _resolve_custom_model_dir(config)
+    if custom is not None:
+        return custom
+
+    # Accept the CPML non-interactively so the download never blocks on a prompt.
+    os.environ.setdefault("COQUI_TOS_AGREED", "1")
+    # Coqui downloads with a parallel snapshot_download — without this, a
+    # Windows account without Developer Mode dies with WinError 1314.
+    hfcache.serialize_symlink_probe()
+    from TTS.utils.manage import ModelManager  # lazy: heavy import
+
+    manager = ModelManager(output_prefix=str(config.models_path))
+    model_path, _config_path, _item = manager.download_model(XTTS_MODEL)
+    # Older coqui-tts returns the model directory; newer releases (HF-hub
+    # download of ``tts-hub/XTTS-v2``) return the ``model.pth`` file inside the
+    # snapshot. Callers need the directory (config.json + checkpoint_dir).
+    if Path(model_path).is_file():
+        return str(Path(model_path).parent)
+    return model_path
+
+
+class XTTSWorker:
+    """Wraps a single Coqui ``Xtts`` model bound to one device and language."""
+
+    supports_streaming = True  # XTTS exposes token streaming via inference_stream
+    # Latents can be computed from a tensor (get_speaker_embedding /
+    # get_gpt_cond_latents), so inline references never need a file.
+    supports_inline_reference = True
+
+    def __init__(self, config: Config, device: str):
+        import torch  # noqa: F401  lazy: heavy import (ensures torch is present)
+        from TTS.tts.configs.xtts_config import XttsConfig
+        from TTS.tts.models.xtts import Xtts
+
+        self.device = device
+        self.sample_rate = DEFAULT_SAMPLE_RATE
+        self._stream_chunk_size = config.stream_chunk_size
+        # One language per process (like the F5 backend); XTTS takes ISO codes
+        # (en/de/fr/ja) that match the wrapper's language keys directly.
+        self._lang = config.language
+        self._cond_cache: dict[str, tuple] = {}
+        # One computation on the model at a time (see WorkerBusyError).
+        self._busy = threading.Lock()
+        # Inline references: bounded (keys come from requests), RAM only.
+        self._inline_cache: ConditioningCache = ConditioningCache(config.inline_ref_cache_size)
+
+        model_dir = _resolve_model_dir(config)
+        xtts_config = XttsConfig()
+        xtts_config.load_json(str(Path(model_dir) / "config.json"))
+        model = Xtts.init_from_config(xtts_config)
+        model.load_checkpoint(
+            xtts_config, checkpoint_dir=model_dir, eval=True, use_deepspeed=False
+        )
+        # XTTS has no DirectML/XPU path; those fall back to CPU (engine self-test).
+        resolved_device = "cpu" if device in ("dml", "xpu") else device
+        model.to(resolved_device)
+        # Optional fp16 speedup — CUDA only (see _should_use_fp16). The inference
+        # outputs are cast back to float32 for PCM, so the HTTP contract is intact.
+        self._fp16 = _should_use_fp16(config, resolved_device)
+        if self._fp16:
+            kept = _apply_fp16(model)
+            ndjson.log_once(
+                f"XTTS fp16 enabled on {resolved_device} "
+                f"(float32 kept for: {', '.join(kept) if kept else 'nothing'})"
+            )
+        self._model = model
+
+        sr = getattr(getattr(xtts_config, "audio", None), "output_sample_rate", None)
+        if isinstance(sr, int) and sr > 0:
+            self.sample_rate = sr
+
+    @contextlib.contextmanager
+    def _exclusive(self):
+        """Hold the model for one computation; a concurrent call fails fast."""
+        if not self._busy.acquire(blocking=False):
+            raise WorkerBusyError("XTTS model is already computing another request")
+        try:
+            yield
+        finally:
+            self._busy.release()
+
+    def _conditioning(self, ref_file: "str | InlineReference") -> tuple:
+        """(gpt_cond_latent, speaker_embedding) for a sample, cached by path —
+        or, for an inline reference, by its voice id in a bounded RAM cache.
+
+        Under fp16 the latents come out of the float32 front-end (see
+        :data:`FP16_FLOAT32_MODULES`) and must be cast to half before they meet
+        the half-precision GPT / vocoder at inference time.
+        """
+        if isinstance(ref_file, InlineReference):
+            return self._inline_cache.get_or_compute(
+                ref_file.voice_id, lambda: self._to_model_dtype(self._inline_latents(ref_file))
+            )
+        cached = self._cond_cache.get(ref_file)
+        if cached is not None:
+            return cached
+        latents = self._to_model_dtype(self._model.get_conditioning_latents(audio_path=[ref_file]))
+        self._cond_cache[ref_file] = latents
+        return latents
+
+    def _to_model_dtype(self, latents: tuple) -> tuple:
+        if self._fp16:
+            return tuple(t.half() if hasattr(t, "half") else t for t in latents)
+        return latents
+
+    def _model_audio(self, audio, sr: int):
+        """Mono float32 → (1, n) tensor at ``XTTS_LOAD_SR``, clipped, on the model device."""
+        import torch  # lazy
+        import torchaudio  # lazy
+
+        t = torch.from_numpy(np.asarray(audio, dtype="float32").reshape(-1)).unsqueeze(0)
+        if sr != XTTS_LOAD_SR:
+            t = torchaudio.functional.resample(t, sr, XTTS_LOAD_SR)
+        return t.clip(-1, 1).to(self._model.device)
+
+    def _inline_latents(self, ref: InlineReference) -> tuple:
+        """``get_conditioning_latents`` for ONE in-memory clip, without a file.
+
+        coqui's method only takes paths (it calls ``torchaudio.load``); the two
+        methods it is built from take tensors. This repeats its body for a
+        single reference with its defaults (no trim, no normalisation): mono at
+        ``XTTS_LOAD_SR``, clipped to [-1, 1], speaker embedding from the clip,
+        GPT latents from the same clip. With one clip its mean over speaker
+        embeddings is the embedding itself.
+        """
+        import torch  # lazy
+        import torchaudio  # lazy
+
+        audio = self._model_audio(ref.audio, ref.sample_rate)
+        with torch.inference_mode():
+            speaker_embedding = self._model.get_speaker_embedding(audio, XTTS_LOAD_SR)
+            gpt_cond_latents = self._model.get_gpt_cond_latents(
+                audio, XTTS_LOAD_SR, length=XTTS_GPT_COND_LEN, chunk_length=XTTS_GPT_COND_CHUNK_LEN
+            )
+        return gpt_cond_latents, speaker_embedding
+
+    def infer(
+        self,
+        ref_file: str,
+        ref_text: str,
+        gen_text: str,
+        nfe_step: int,
+        speed: float,
+        language: str | None = None,
+    ) -> np.ndarray:
+        # ref_text / nfe_step are F5 concepts; XTTS ignores them (clones from
+        # the audio directly and has no NFE steps). ``language`` selects the
+        # target language per request (XTTS is multilingual → no reload); falls
+        # back to the startup language when omitted.
+        with self._exclusive():
+            gpt_cond_latent, speaker_embedding = self._conditioning(ref_file)
+            out = self._model.inference(
+                gen_text,
+                language or self._lang,
+                gpt_cond_latent,
+                speaker_embedding,
+                speed=speed,
+                enable_text_splitting=False,
+            )
+        return np.asarray(out["wav"], dtype=np.float32)
+
+    def infer_stream(
+        self,
+        ref_file: str,
+        ref_text: str,
+        gen_text: str,
+        speed: float,
+        language: str | None = None,
+    ):
+        """Yield float32 audio chunks as XTTS generates them (token streaming).
+
+        Lower first-audio latency than :meth:`infer`: audio starts flowing before
+        the whole chunk is synthesized. The engine pumps this sync generator one
+        item at a time in a thread. ``ref_text`` is ignored (XTTS clones from the
+        audio alone); ``language`` selects the target language per request (no
+        reload), defaulting to the startup language when omitted."""
+        with self._exclusive():
+            gpt_cond_latent, speaker_embedding = self._conditioning(ref_file)
+        stream = self._model.inference_stream(
+            gen_text,
+            language or self._lang,
+            gpt_cond_latent,
+            speaker_embedding,
+            speed=speed,
+            enable_text_splitting=False,
+            stream_chunk_size=self._stream_chunk_size,
+        )
+        while True:
+            # Held per step, never across the yield: coqui's generator does its
+            # work (incl. store_prefix_emb on the first step) inside next().
+            with self._exclusive():
+                try:
+                    wav_chunk = next(stream)
+                except StopIteration:
+                    return
+            # XTTS yields torch tensors on the compute device; move to a flat
+            # CPU float32 array for float_to_pcm16.
+            arr = wav_chunk.detach().to("cpu").numpy() if hasattr(wav_chunk, "detach") else np.asarray(wav_chunk)
+            yield np.asarray(arr, dtype=np.float32).reshape(-1)
+
+    # ------------------------------------------------- speaker embedding
+    # The HiFi-GAN speaker encoder XTTS conditions on (512 values). One name for
+    # base model and finetunes: a finetune keeps the encoder frozen in coqui's
+    # recipe, but a custom model could differ — the plugin only compares vectors
+    # of ONE run, so a mismatch would at worst blur one batch, never mix runs.
+    speaker_encoder = "xtts-v2-speaker"
+
+    def speaker_embedding(self, audio, sr: int):
+        """Speaker vector of one clip, from memory (``POST /speaker-embedding``)."""
+        import torch  # lazy
+
+        t = self._model_audio(audio, sr)
+        with self._exclusive(), torch.inference_mode():
+            vec = self._model.get_speaker_embedding(t, XTTS_LOAD_SR)
+        return vec.detach().float().cpu().numpy().reshape(-1)
+
+    def transcribe(self, audio_path: Path) -> str:
+        # XTTS clones from the reference audio directly; it never needs the
+        # transcript, so ref-text resolution is a no-op for this backend.
+        return ""
+
+    def self_test(self) -> bool:
+        """Tiny inference to confirm the backend works (engine runs this only
+        for fragile dml/xpu devices, which XTTS anyway maps to CPU)."""
+        return selftest.run(self)
+
+
+def download_model(config: Config) -> None:
+    """Pre-download XTTS-v2 at install time. Idempotent (see resolver).
+
+    Coqui's ``ModelManager`` fetches several files (model, config, vocab,
+    speakers) — each is reported as a per-file ``progress`` bar via the tqdm
+    hook in :mod:`src.progress`, on top of the coarse start/done ``log`` lines.
+    """
+    config.models_path.mkdir(parents=True, exist_ok=True)
+    mp = progress.ModelProgress()
+    mp.stage("XTTS-v2: ")
+    ndjson.log(i18n.t("model.loading", name="XTTS-v2"))
+    with mp.patch():
+        _resolve_model_dir(config)
+    ndjson.log(i18n.t("model.ready", name="XTTS-v2"))
+
+
+if __name__ == "__main__":
+    # Entry point used by the bootstrap (run inside the venv) when the active
+    # backend is XTTS: downloads the XTTS-v2 weights into models/.
+    import sys
+    import traceback
+
+    try:
+        download_model(load_config())
+    except Exception as exc:  # noqa: BLE001 — surface as a fatal NDJSON error
+        traceback.print_exc(file=sys.stderr)
+        ndjson.error(i18n.t("model.download_failed", name="XTTS-v2", error=exc), fatal=True)
+        raise SystemExit(1)

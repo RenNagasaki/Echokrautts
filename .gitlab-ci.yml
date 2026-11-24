@@ -1,0 +1,70 @@
+# Echokrautts CI — Python F5-TTS wrapper.
+# NOTE: This is NOT a C# Dalamud plugin, so the parent Dalamud SonarQube/.NET
+# pipeline does not apply here (see wrapper-repo CLAUDE.md). Two jobs only:
+#   1. test   — run the unit suite (torch/f5-tts mocked) on every branch.
+#   2. mirror — snapshot of main (one parentless commit) to the GitHub mirror, main + tags.
+
+# Datenschutz-Gate vor dem GitHub-Mirror (Vorlage und Einrichtung: private/claude
+# › tools/ci/privacy-gate.gitlab-ci.yml).
+include:
+  - project: private/claude
+    file: tools/ci/privacy-gate.gitlab-ci.yml
+
+stages:
+  - test
+  - privacy
+  - mirror
+
+# ---------------------------------------------------------------------------
+# Unit tests. The suite deliberately mocks torch/f5-tts (see wrapper/conftest.py),
+# so it needs only the lightweight dev deps and runs in a plain Python image.
+# ---------------------------------------------------------------------------
+test:
+  stage: test
+  image: python:3.12-slim
+  rules:
+    - if: $CI_COMMIT_BRANCH
+  before_script:
+    - python -m pip install --upgrade pip
+    # Install dev/test deps explicitly — do NOT `pip install .[dev]`, which would
+    # drag in the base deps (f5-tts → torch) that the tests mock and never need.
+    - pip install pytest pytest-asyncio httpx fastapi numpy
+  script:
+    - cd wrapper
+    - python -m pytest -q
+
+# ---------------------------------------------------------------------------
+# GitHub mirror. Snapshot of main + tag pipelines (2026-11-23): one parentless commit, no history.
+# Older branches/tags on GitHub keep the old history reachable (manual cleanup).
+# Never `git push --mirror`: it deletes GitHub-only tags and their Releases.
+# ---------------------------------------------------------------------------
+# Datenschutz-Gate: laeuft genau dann, wenn gespiegelt wird (rules wie mirror-to-github),
+# und bricht den Mirror bei einem Verweis auf Person/Infrastruktur ab.
+privacy-gate:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+  variables:
+    PRIVACY_SCAN_MODE: tree   # Snapshot-Mirror: nur der gespiegelte Baum zaehlt
+
+mirror-to-github:
+  stage: mirror
+  image: alpine/git:latest
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+  variables:
+    # The snapshot commit reuses the checked-out tree; submodules stay gitlinks in the index.
+    GIT_SUBMODULE_STRATEGY: none
+  script:
+    - git config --global user.email "ci@example.org"
+    - git config --global user.name "Echokrautts CI"
+    # --orphan keeps the index: committing right away reproduces this pipeline's tree, no parent.
+    - git checkout --orphan snapshot
+    - git commit -q -m "Echokrautts ${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+    # Hardcoded GitHub path: ${GITHUB_USER} is the PAT owner, not necessarily the repo owner.
+    - git remote add github "https://${GITHUB_USER}:${GITHUB_PAT}@github.com/RenNagasaki/Echokrautts.git"
+    # Force is inherent to the design: each snapshot is unrelated to the last.
+    - if [ -n "$CI_COMMIT_BRANCH" ]; then git push github "snapshot:$CI_DEFAULT_BRANCH" --force; fi
+    # Tag pipelines repoint the tag at the snapshot; non-force, an existing GitHub tag is never overwritten.
+    - if [ -n "$CI_COMMIT_TAG" ]; then git tag -f "$CI_COMMIT_TAG" && git push github "refs/tags/$CI_COMMIT_TAG"; fi
